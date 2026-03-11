@@ -1,0 +1,5 @@
+{
+  "name": "Live Stream Studio",
+  "description": "A mobile-friendly live streaming studio with camera access, image overlays, and scrolling tickers.",
+  "requestFramePermissions": ["camera", "microphone"]
+}

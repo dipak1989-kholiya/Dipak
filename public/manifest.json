@@ -1,0 +1,21 @@
+{
+  "name": "Live Stream Studio",
+  "short_name": "Stream Studio",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#09090b",
+  "theme_color": "#09090b",
+  "description": "A powerful browser-based live streaming studio.",
+  "icons": [
+    {
+      "src": "https://picsum.photos/seed/stream/192/192",
+      "sizes": "192x192",
+      "type": "image/png"
+    },
+    {
+      "src": "https://picsum.photos/seed/stream/512/512",
+      "sizes": "512x512",
+      "type": "image/png"
+    }
+  ]
+}
