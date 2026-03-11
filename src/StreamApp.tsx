@@ -1,5 +1,5 @@
-import { useState, useRef, useEffect, useCallback, MouseEvent, TouchEvent } from 'react';
-import { Camera, Image as ImageIcon, Type, Play, Square, Settings, Upload, X, Plus, Sliders, ChevronDown, ChevronUp } from 'lucide-react';
+import { useState, useRef, useEffect, useCallback, MouseEvent, TouchEvent, FormEvent } from 'react';
+import { Camera, Image as ImageIcon, Type, Play, Square, Settings, Upload, X, Plus, Sliders, ChevronDown, ChevronUp, Users } from 'lucide-react';
 import { useDropzone } from 'react-dropzone';
 import { clsx, type ClassValue } from 'clsx';
 import { twMerge } from 'tailwind-merge';
@@ -18,18 +18,20 @@ type StreamDestination = {
   status: 'disconnected' | 'connecting' | 'streaming';
 };
 
-type ImageOverlay = {
+type StreamOverlay = {
   id: string;
-  src: string;
+  type: 'image' | 'text';
+  content: string;
   size: number;
   x: number;
   y: number;
   rotation: number;
+  color?: string;
 };
 
 const STORAGE_KEY = 'live_stream_settings';
 
-export default function StreamApp({ token, onLogout }: { token: string; onLogout: () => void }) {
+export default function StreamApp({ token, username, onLogout }: { token: string; username: string; onLogout: () => void }) {
   const [stream, setStream] = useState<MediaStream | null>(null);
   const [isStreaming, setIsStreaming] = useState(false);
   const [destinations, setDestinations] = useState<StreamDestination[]>([
@@ -60,18 +62,12 @@ export default function StreamApp({ token, onLogout }: { token: string; onLogout
   const [tempTickerY, setTempTickerY] = useState(92);
   const [tickerTextColor, setTickerTextColor] = useState('#ffffff');
   const [tickerBgColor, setTickerBgColor] = useState('rgba(0, 0, 0, 0.6)');
-  const [imageOverlays, setImageOverlays] = useState<ImageOverlay[]>([]);
+  const [overlays, setOverlays] = useState<StreamOverlay[]>([]);
   const [draggingImageId, setDraggingImageId] = useState<string | null>(null);
   const [resizingImageId, setResizingImageId] = useState<string | null>(null);
   const [rotatingImageId, setRotatingImageId] = useState<string | null>(null);
   const [selectedOverlayId, setSelectedOverlayId] = useState<string | null>(null);
   const [hoveredOverlayId, setHoveredOverlayId] = useState<string | null>(null);
-  const [overlayText, setOverlayText] = useState('');
-  const [overlayTextColor, setOverlayTextColor] = useState('#ffffff');
-  const [overlayTextSize, setOverlayTextSize] = useState(40);
-  const [overlayTextX, setOverlayTextX] = useState(50);
-  const [overlayTextY, setOverlayTextY] = useState(50);
-  const [isDraggingText, setIsDraggingText] = useState(false);
   const [showControls, setShowControls] = useState(true);
   const [activeTab, setActiveTab] = useState<'stream' | 'overlays' | 'ticker' | 'adjust'>('stream');
   const [cameraFacing, setCameraFacing] = useState<'user' | 'environment'>('user');
@@ -79,6 +75,10 @@ export default function StreamApp({ token, onLogout }: { token: string; onLogout
   const [idealHeight, setIdealHeight] = useState(720);
   const [idealFrameRate, setIdealFrameRate] = useState(30);
   const [isSettingsModalOpen, setIsSettingsModalOpen] = useState(false);
+  const [users, setUsers] = useState<{id: number, username: string}[]>([]);
+  const [newUsername, setNewUsername] = useState('');
+  const [newPassword, setNewPassword] = useState('');
+  const [userError, setUserError] = useState('');
   const [streamStats, setStreamStats] = useState<Record<string, { bitrate: number; uptime: number; fps: number }>>({});
   const [brightness, setBrightness] = useState(100);
   const [contrast, setContrast] = useState(100);
@@ -87,6 +87,16 @@ export default function StreamApp({ token, onLogout }: { token: string; onLogout
 
   // Load settings on startup
   useEffect(() => {
+    const loadUsers = async () => {
+      if (username !== 'admin') return;
+      try {
+        const res = await fetch('/api/users', { headers: { Authorization: `Bearer ${token}` } });
+        if (res.ok) {
+          setUsers(await res.json());
+        }
+      } catch (e) {}
+    };
+
     const loadData = async () => {
       // Load from backend
       try {
@@ -124,12 +134,24 @@ export default function StreamApp({ token, onLogout }: { token: string; onLogout
           }
           if (settings.tickerTextColor !== undefined) setTickerTextColor(settings.tickerTextColor);
           if (settings.tickerBgColor !== undefined) setTickerBgColor(settings.tickerBgColor);
-          if (settings.imageOverlays !== undefined) setImageOverlays(settings.imageOverlays);
-          if (settings.overlayText !== undefined) setOverlayText(settings.overlayText);
-          if (settings.overlayTextColor !== undefined) setOverlayTextColor(settings.overlayTextColor);
-          if (settings.overlayTextSize !== undefined) setOverlayTextSize(settings.overlayTextSize);
-          if (settings.overlayTextX !== undefined) setOverlayTextX(settings.overlayTextX);
-          if (settings.overlayTextY !== undefined) setOverlayTextY(settings.overlayTextY);
+          if (settings.overlays !== undefined) {
+            setOverlays(settings.overlays);
+          } else if (settings.imageOverlays !== undefined) {
+            const migrated: StreamOverlay[] = settings.imageOverlays.map((img: any) => ({ ...img, type: 'image', content: img.src }));
+            if (settings.overlayText) {
+              migrated.push({
+                id: 'legacy-text',
+                type: 'text',
+                content: settings.overlayText,
+                size: settings.overlayTextSize / 10,
+                x: settings.overlayTextX,
+                y: settings.overlayTextY,
+                rotation: 0,
+                color: settings.overlayTextColor
+              });
+            }
+            setOverlays(migrated);
+          }
           if (settings.cameraFacing !== undefined) setCameraFacing(settings.cameraFacing);
           if (settings.idealWidth !== undefined) setIdealWidth(settings.idealWidth);
           if (settings.idealHeight !== undefined) setIdealHeight(settings.idealHeight);
@@ -143,7 +165,8 @@ export default function StreamApp({ token, onLogout }: { token: string; onLogout
       }
     };
     loadData();
-  }, []);
+    loadUsers();
+  }, [token, username, onLogout]);
 
   // Save settings on changes
   useEffect(() => {
@@ -155,12 +178,7 @@ export default function StreamApp({ token, onLogout }: { token: string; onLogout
       tickerYPercent,
       tickerTextColor,
       tickerBgColor,
-      imageOverlays,
-      overlayText,
-      overlayTextColor,
-      overlayTextSize,
-      overlayTextX,
-      overlayTextY,
+      overlays,
       cameraFacing,
       idealWidth,
       idealHeight,
@@ -172,8 +190,7 @@ export default function StreamApp({ token, onLogout }: { token: string; onLogout
     localStorage.setItem(STORAGE_KEY, JSON.stringify(settings));
   }, [
     destinations, tickerText, tickerSpeed, tickerHeightPercent, tickerYPercent,
-    tickerTextColor, tickerBgColor, imageOverlays, overlayText, overlayTextColor,
-    overlayTextSize, overlayTextX, overlayTextY, cameraFacing, idealWidth,
+    tickerTextColor, tickerBgColor, overlays, cameraFacing, idealWidth,
     idealHeight, idealFrameRate, brightness, contrast, saturation
   ]);
 
@@ -270,7 +287,7 @@ export default function StreamApp({ token, onLogout }: { token: string; onLogout
       if ((e.key === 'Delete' || e.key === 'Backspace') && selectedOverlayId) {
         // Only delete if not typing in an input
         if (document.activeElement?.tagName !== 'INPUT' && document.activeElement?.tagName !== 'TEXTAREA') {
-          setImageOverlays(prev => prev.filter(img => img.id !== selectedOverlayId));
+          setOverlays(prev => prev.filter(img => img.id !== selectedOverlayId));
           setSelectedOverlayId(null);
         }
       }
@@ -363,58 +380,79 @@ export default function StreamApp({ token, onLogout }: { token: string; onLogout
         ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
         ctx.filter = 'none'; // Reset filter for overlays
 
-        // 2. Draw Image Overlays
-        imageOverlays.forEach(overlay => {
-          const img = imageElementsRef.current.get(overlay.id);
-          if (img && img.complete && img.naturalWidth > 0) {
-            const size = (overlay.size / 100) * canvas.width;
-            const x = (overlay.x / 100) * canvas.width;
-            const y = (overlay.y / 100) * canvas.height;
+        // 2. Draw Overlays (Watermarks)
+        overlays.forEach(overlay => {
+          const size = (overlay.size / 100) * canvas.width;
+          const x = (overlay.x / 100) * canvas.width;
+          const y = (overlay.y / 100) * canvas.height;
 
-            ctx.save();
-            ctx.translate(x, y);
-            ctx.rotate((overlay.rotation * Math.PI) / 180);
-            
-            const left = -size / 2;
-            const top = -size / 2;
+          ctx.save();
+          ctx.translate(x, y);
+          ctx.rotate((overlay.rotation * Math.PI) / 180);
+          
+          let boxWidth = size;
+          let boxHeight = size;
 
-            ctx.drawImage(img, left, top, size, size);
-
-            // Draw selection/hover feedback
-            if (selectedOverlayId === overlay.id || hoveredOverlayId === overlay.id) {
-              ctx.strokeStyle = selectedOverlayId === overlay.id ? '#10b981' : 'rgba(16, 185, 129, 0.5)';
-              ctx.lineWidth = 2;
-              ctx.setLineDash([5, 5]);
-              ctx.strokeRect(left - 2, top - 2, size + 4, size + 4);
-              ctx.setLineDash([]);
-
-              if (selectedOverlayId === overlay.id) {
-                // Draw Resize Handle (bottom-right)
-                ctx.fillStyle = '#10b981';
-                ctx.fillRect(left + size - 4, top + size - 4, 8, 8);
-                ctx.strokeStyle = '#ffffff';
-                ctx.lineWidth = 1;
-                ctx.strokeRect(left + size - 4, top + size - 4, 8, 8);
-
-                // Draw Rotation Handle (top-center)
-                ctx.beginPath();
-                ctx.moveTo(0, top - 2);
-                ctx.lineTo(0, top - 20);
-                ctx.strokeStyle = '#10b981';
-                ctx.lineWidth = 2;
-                ctx.stroke();
-
-                ctx.beginPath();
-                ctx.arc(0, top - 25, 6, 0, Math.PI * 2);
-                ctx.fillStyle = '#10b981';
-                ctx.fill();
-                ctx.strokeStyle = '#ffffff';
-                ctx.lineWidth = 1;
-                ctx.stroke();
-              }
+          if (overlay.type === 'image') {
+            const img = imageElementsRef.current.get(overlay.id);
+            if (img && img.complete && img.naturalWidth > 0) {
+              const left = -size / 2;
+              const top = -size / 2;
+              ctx.drawImage(img, left, top, size, size);
             }
-            ctx.restore();
+          } else if (overlay.type === 'text') {
+            ctx.font = `${size}px sans-serif`;
+            ctx.fillStyle = overlay.color || '#ffffff';
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'middle';
+            ctx.shadowColor = 'rgba(0, 0, 0, 0.5)';
+            ctx.shadowBlur = 4;
+            ctx.shadowOffsetX = 2;
+            ctx.shadowOffsetY = 2;
+            ctx.fillText(overlay.content, 0, 0);
+            ctx.shadowColor = 'transparent';
+            
+            boxWidth = ctx.measureText(overlay.content).width + 20;
+            boxHeight = size + 10;
           }
+
+          // Draw selection/hover feedback
+          if (selectedOverlayId === overlay.id || hoveredOverlayId === overlay.id) {
+            const left = -boxWidth / 2;
+            const top = -boxHeight / 2;
+
+            ctx.strokeStyle = selectedOverlayId === overlay.id ? '#10b981' : 'rgba(16, 185, 129, 0.5)';
+            ctx.lineWidth = 2;
+            ctx.setLineDash([5, 5]);
+            ctx.strokeRect(left - 2, top - 2, boxWidth + 4, boxHeight + 4);
+            ctx.setLineDash([]);
+
+            if (selectedOverlayId === overlay.id) {
+              // Draw Resize Handle (bottom-right)
+              ctx.fillStyle = '#10b981';
+              ctx.fillRect(left + boxWidth - 4, top + boxHeight - 4, 8, 8);
+              ctx.strokeStyle = '#ffffff';
+              ctx.lineWidth = 1;
+              ctx.strokeRect(left + boxWidth - 4, top + boxHeight - 4, 8, 8);
+
+              // Draw Rotation Handle (top-center)
+              ctx.beginPath();
+              ctx.moveTo(0, top - 2);
+              ctx.lineTo(0, top - 20);
+              ctx.strokeStyle = '#10b981';
+              ctx.lineWidth = 2;
+              ctx.stroke();
+
+              ctx.beginPath();
+              ctx.arc(0, top - 25, 6, 0, Math.PI * 2);
+              ctx.fillStyle = '#10b981';
+              ctx.fill();
+              ctx.strokeStyle = '#ffffff';
+              ctx.lineWidth = 1;
+              ctx.stroke();
+            }
+          }
+          ctx.restore();
         });
 
         // 3. Draw Ticker
@@ -436,31 +474,6 @@ export default function StreamApp({ token, onLogout }: { token: string; onLogout
           tickerOffsetRef.current = canvas.width;
         }
 
-        // 4. Draw Text Overlay (if any)
-        if (overlayText) {
-          ctx.font = `${(overlayTextSize / 1000) * canvas.width}px sans-serif`;
-          ctx.fillStyle = overlayTextColor;
-          ctx.textAlign = 'center';
-          ctx.textBaseline = 'middle';
-          
-          // Add a subtle shadow for readability
-          ctx.shadowColor = 'rgba(0, 0, 0, 0.5)';
-          ctx.shadowBlur = 4;
-          ctx.shadowOffsetX = 2;
-          ctx.shadowOffsetY = 2;
-          
-          ctx.fillText(
-            overlayText, 
-            (overlayTextX / 100) * canvas.width, 
-            (overlayTextY / 100) * canvas.height
-          );
-          
-          // Reset shadow
-          ctx.shadowColor = 'transparent';
-          ctx.shadowBlur = 0;
-          ctx.shadowOffsetX = 0;
-          ctx.shadowOffsetY = 0;
-        }
       }
       requestRef.current = requestAnimationFrame(render);
     };
@@ -469,22 +482,23 @@ export default function StreamApp({ token, onLogout }: { token: string; onLogout
     return () => {
       if (requestRef.current) cancelAnimationFrame(requestRef.current);
     };
-  }, [tickerText, imageOverlays, tickerSpeed, overlayText, overlayTextColor, overlayTextSize, overlayTextX, overlayTextY, tickerHeightPercent, tickerYPercent, brightness, contrast, saturation, tickerTextColor, tickerBgColor, selectedOverlayId, hoveredOverlayId, rotatingImageId, resizingImageId]);
+  }, [tickerText, overlays, tickerSpeed, tickerHeightPercent, tickerYPercent, brightness, contrast, saturation, tickerTextColor, tickerBgColor, selectedOverlayId, hoveredOverlayId, rotatingImageId, resizingImageId]);
 
   const onDrop = useCallback((acceptedFiles: File[]) => {
     acceptedFiles.forEach(file => {
       const reader = new FileReader();
       reader.onload = () => {
         const src = reader.result as string;
-        const newOverlay: ImageOverlay = {
+        const newOverlay: StreamOverlay = {
           id: Math.random().toString(36).substr(2, 9),
-          src,
+          type: 'image',
+          content: src,
           size: 15,
           x: 50,
           y: 50,
           rotation: 0
         };
-        setImageOverlays(prev => [...prev, newOverlay]);
+        setOverlays(prev => [...prev, newOverlay]);
       };
       reader.readAsDataURL(file);
     });
@@ -500,6 +514,43 @@ export default function StreamApp({ token, onLogout }: { token: string; onLogout
 
   const toggleCamera = () => {
     setCameraFacing(prev => prev === 'user' ? 'environment' : 'user');
+  };
+
+  const handleAddUser = async (e: FormEvent) => {
+    e.preventDefault();
+    setUserError('');
+    try {
+      const res = await fetch('/api/users', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ username: newUsername, password: newPassword })
+      });
+      if (res.ok) {
+        setNewUsername('');
+        setNewPassword('');
+        // Reload users
+        const usersRes = await fetch('/api/users', { headers: { Authorization: `Bearer ${token}` } });
+        if (usersRes.ok) setUsers(await usersRes.json());
+      } else {
+        const data = await res.json();
+        setUserError(data.error || 'Failed to add user');
+      }
+    } catch (e) {
+      setUserError('Network error');
+    }
+  };
+
+  const handleDeleteUser = async (id: number) => {
+    try {
+      const res = await fetch(`/api/users/${id}`, {
+        method: 'DELETE',
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      if (res.ok) {
+        const usersRes = await fetch('/api/users', { headers: { Authorization: `Bearer ${token}` } });
+        if (usersRes.ok) setUsers(await usersRes.json());
+      }
+    } catch (e) {}
   };
 
   const updateDestination = async (id: string, updates: Partial<StreamDestination>) => {
@@ -722,28 +773,28 @@ export default function StreamApp({ token, onLogout }: { token: string; onLogout
 
     if (e.type === 'mousedown' || e.type === 'touchstart') {
       if (e.type === 'touchstart') e.preventDefault();
-      
-      // Check if click is near the text (within 10% threshold)
-      if (overlayText) {
-        const distText = Math.sqrt(Math.pow(x - overlayTextX, 2) + Math.pow(y - overlayTextY, 2));
-        if (distText < 10) {
-          setIsDraggingText(true);
-          setSelectedOverlayId(null);
-          return;
-        }
-      }
 
-      // Check images (reverse order to pick top-most)
-      for (let i = imageOverlays.length - 1; i >= 0; i--) {
-        const overlay = imageOverlays[i];
+      // Check overlays (reverse order to pick top-most)
+      for (let i = overlays.length - 1; i >= 0; i--) {
+        const overlay = overlays[i];
         const sizePx = (overlay.size / 100) * canvas.width;
         const xPx = (overlay.x / 100) * canvas.width;
         const yPx = (overlay.y / 100) * canvas.height;
         const rotationRad = (overlay.rotation * Math.PI) / 180;
 
+        let boxWidth = sizePx;
+        let boxHeight = sizePx;
+        if (overlay.type === 'text') {
+          const ctx = canvas.getContext('2d');
+          if (ctx) {
+            ctx.font = `${sizePx}px sans-serif`;
+            boxWidth = ctx.measureText(overlay.content).width + 20;
+            boxHeight = sizePx + 10;
+          }
+        }
+
         // Check Rotation Handle (top-center)
-        // Handle is at (0, -size/2 - 25) in rotated space
-        const handleDist = sizePx / 2 + 25;
+        const handleDist = boxHeight / 2 + 25;
         const handleXPx = xPx + Math.sin(rotationRad) * handleDist;
         const handleYPx = yPx - Math.cos(rotationRad) * handleDist;
         
@@ -754,10 +805,8 @@ export default function StreamApp({ token, onLogout }: { token: string; onLogout
         }
 
         // Check Resize Handle (bottom-right)
-        // Handle is at (size/2, size/2) in rotated space
-        const handleOffset = sizePx / 2;
-        const resizeXPx = xPx + Math.cos(rotationRad) * handleOffset - Math.sin(rotationRad) * handleOffset;
-        const resizeYPx = yPx + Math.sin(rotationRad) * handleOffset + Math.cos(rotationRad) * handleOffset;
+        const resizeXPx = xPx + Math.cos(rotationRad) * (boxWidth / 2) - Math.sin(rotationRad) * (boxHeight / 2);
+        const resizeYPx = yPx + Math.sin(rotationRad) * (boxWidth / 2) + Math.cos(rotationRad) * (boxHeight / 2);
         
         const distToResizeHandle = Math.sqrt(Math.pow(px - resizeXPx, 2) + Math.pow(py - resizeYPx, 2));
         if (distToResizeHandle < 15 && selectedOverlayId === overlay.id) {
@@ -765,13 +814,13 @@ export default function StreamApp({ token, onLogout }: { token: string; onLogout
           return;
         }
 
-        // Check if click is inside the image (accounting for rotation)
+        // Check if click is inside the overlay (accounting for rotation)
         const dx = px - xPx;
         const dy = py - yPx;
         const localX = dx * Math.cos(-rotationRad) - dy * Math.sin(-rotationRad);
         const localY = dx * Math.sin(-rotationRad) + dy * Math.cos(-rotationRad);
 
-        if (Math.abs(localX) <= sizePx / 2 && Math.abs(localY) <= sizePx / 2) {
+        if (Math.abs(localX) <= boxWidth / 2 && Math.abs(localY) <= boxHeight / 2) {
           setDraggingImageId(overlay.id);
           setSelectedOverlayId(overlay.id);
           return;
@@ -784,51 +833,58 @@ export default function StreamApp({ token, onLogout }: { token: string; onLogout
     } else if ((e.type === 'mousemove' || e.type === 'touchmove')) {
       // Update hover state
       let foundHover = null;
-      for (let i = imageOverlays.length - 1; i >= 0; i--) {
-        const overlay = imageOverlays[i];
+      for (let i = overlays.length - 1; i >= 0; i--) {
+        const overlay = overlays[i];
         const sizePx = (overlay.size / 100) * canvas.width;
         const xPx = (overlay.x / 100) * canvas.width;
         const yPx = (overlay.y / 100) * canvas.height;
         const rotationRad = (overlay.rotation * Math.PI) / 180;
+
+        let boxWidth = sizePx;
+        let boxHeight = sizePx;
+        if (overlay.type === 'text') {
+          const ctx = canvas.getContext('2d');
+          if (ctx) {
+            ctx.font = `${sizePx}px sans-serif`;
+            boxWidth = ctx.measureText(overlay.content).width + 20;
+            boxHeight = sizePx + 10;
+          }
+        }
 
         const dx = px - xPx;
         const dy = py - yPx;
         const localX = dx * Math.cos(-rotationRad) - dy * Math.sin(-rotationRad);
         const localY = dx * Math.sin(-rotationRad) + dy * Math.cos(-rotationRad);
 
-        if (Math.abs(localX) <= sizePx / 2 && Math.abs(localY) <= sizePx / 2) {
+        if (Math.abs(localX) <= boxWidth / 2 && Math.abs(localY) <= boxHeight / 2) {
           foundHover = overlay.id;
           break;
         }
       }
       setHoveredOverlayId(foundHover);
 
-      if (isDraggingText) {
+      if (draggingImageId) {
         if (e.type === 'touchmove') e.preventDefault();
-        setOverlayTextX(Math.max(0, Math.min(100, x)));
-        setOverlayTextY(Math.max(0, Math.min(100, y)));
-      } else if (draggingImageId) {
-        if (e.type === 'touchmove') e.preventDefault();
-        setImageOverlays(prev => prev.map(img => 
+        setOverlays(prev => prev.map(img => 
           img.id === draggingImageId 
             ? { ...img, x: Math.max(0, Math.min(100, x)), y: Math.max(0, Math.min(100, y)) }
             : img
         ));
       } else if (resizingImageId) {
         if (e.type === 'touchmove') e.preventDefault();
-        setImageOverlays(prev => prev.map(img => {
+        setOverlays(prev => prev.map(img => {
           if (img.id === resizingImageId) {
             const xPx = (img.x / 100) * canvas.width;
             const yPx = (img.y / 100) * canvas.height;
             const dist = Math.sqrt(Math.pow(px - xPx, 2) + Math.pow(py - yPx, 2));
-            const newSize = Math.max(5, Math.min(100, (dist * 2 / canvas.width) * 100));
+            const newSize = Math.max(2, Math.min(100, (dist * 2 / canvas.width) * 100));
             return { ...img, size: newSize };
           }
           return img;
         }));
       } else if (rotatingImageId) {
         if (e.type === 'touchmove') e.preventDefault();
-        setImageOverlays(prev => prev.map(img => {
+        setOverlays(prev => prev.map(img => {
           if (img.id === rotatingImageId) {
             const xPx = (img.x / 100) * canvas.width;
             const yPx = (img.y / 100) * canvas.height;
@@ -840,7 +896,6 @@ export default function StreamApp({ token, onLogout }: { token: string; onLogout
         }));
       }
     } else if (e.type === 'mouseup' || e.type === 'touchend') {
-      setIsDraggingText(false);
       setDraggingImageId(null);
       setResizingImageId(null);
       setRotatingImageId(null);
@@ -862,14 +917,14 @@ export default function StreamApp({ token, onLogout }: { token: string; onLogout
         />
 
         {/* Hidden Image Sources for GIF Animation */}
-        {imageOverlays.map(overlay => (
+        {overlays.filter(o => o.type === 'image').map(overlay => (
           <img 
             key={overlay.id}
             ref={el => {
               if (el) imageElementsRef.current.set(overlay.id, el);
               else imageElementsRef.current.delete(overlay.id);
             }}
-            src={overlay.src}
+            src={overlay.content}
             className="absolute opacity-0 pointer-events-none"
             alt="Overlay Source"
           />
@@ -889,8 +944,8 @@ export default function StreamApp({ token, onLogout }: { token: string; onLogout
               "max-h-full max-w-full object-contain shadow-2xl transition-all touch-none",
               resizingImageId ? "cursor-nwse-resize" :
               rotatingImageId ? "cursor-alias" :
-              (isDraggingText || draggingImageId) ? "cursor-grabbing" : 
-              (hoveredOverlayId || isDraggingText) ? "cursor-grab" : "cursor-default"
+              draggingImageId ? "cursor-grabbing" : 
+              hoveredOverlayId ? "cursor-grab" : "cursor-default"
             )}
           />
           
@@ -1089,7 +1144,7 @@ export default function StreamApp({ token, onLogout }: { token: string; onLogout
           {/* Tabs */}
           <div className="flex items-center gap-2 p-4 border-b border-white/5 overflow-x-auto shrink-0 no-scrollbar">
             <button onClick={() => setActiveTab('stream')} className={cn("px-4 py-2 rounded-full text-xs font-bold uppercase tracking-widest whitespace-nowrap transition-colors", activeTab === 'stream' ? "bg-emerald-500 text-zinc-950" : "bg-zinc-800 text-zinc-400 hover:bg-zinc-700")}>Stream</button>
-            <button onClick={() => setActiveTab('overlays')} className={cn("px-4 py-2 rounded-full text-xs font-bold uppercase tracking-widest whitespace-nowrap transition-colors", activeTab === 'overlays' ? "bg-emerald-500 text-zinc-950" : "bg-zinc-800 text-zinc-400 hover:bg-zinc-700")}>Overlays</button>
+            <button onClick={() => setActiveTab('overlays')} className={cn("px-4 py-2 rounded-full text-xs font-bold uppercase tracking-widest whitespace-nowrap transition-colors", activeTab === 'overlays' ? "bg-emerald-500 text-zinc-950" : "bg-zinc-800 text-zinc-400 hover:bg-zinc-700")}>Watermarks</button>
             <button onClick={() => setActiveTab('ticker')} className={cn("px-4 py-2 rounded-full text-xs font-bold uppercase tracking-widest whitespace-nowrap transition-colors", activeTab === 'ticker' ? "bg-emerald-500 text-zinc-950" : "bg-zinc-800 text-zinc-400 hover:bg-zinc-700")}>Ticker</button>
             <button onClick={() => setActiveTab('adjust')} className={cn("px-4 py-2 rounded-full text-xs font-bold uppercase tracking-widest whitespace-nowrap transition-colors", activeTab === 'adjust' ? "bg-emerald-500 text-zinc-950" : "bg-zinc-800 text-zinc-400 hover:bg-zinc-700")}>Adjust</button>
           </div>
@@ -1097,6 +1152,52 @@ export default function StreamApp({ token, onLogout }: { token: string; onLogout
           <div className="p-6 overflow-y-auto flex-1">
             <div className="max-w-7xl mx-auto grid grid-cols-1 md:grid-cols-2 gap-8">
               
+              {/* User Management (Admin Only) */}
+              {username === 'admin' && (
+                <div className="mb-8 p-6 bg-zinc-950 rounded-2xl border border-white/5">
+                  <h3 className="text-lg font-bold mb-4 flex items-center gap-2">
+                    <Users className="w-5 h-5 text-emerald-500" />
+                    User Management
+                  </h3>
+                  
+                  <form onSubmit={handleAddUser} className="flex gap-2 mb-4">
+                    <input 
+                      type="text" 
+                      placeholder="Username" 
+                      value={newUsername}
+                      onChange={e => setNewUsername(e.target.value)}
+                      className="flex-1 bg-zinc-900 border border-white/10 rounded-xl px-4 py-2 text-sm text-white focus:outline-none focus:border-emerald-500"
+                      required
+                    />
+                    <input 
+                      type="password" 
+                      placeholder="Password" 
+                      value={newPassword}
+                      onChange={e => setNewPassword(e.target.value)}
+                      className="flex-1 bg-zinc-900 border border-white/10 rounded-xl px-4 py-2 text-sm text-white focus:outline-none focus:border-emerald-500"
+                      required
+                    />
+                    <button type="submit" className="bg-emerald-500 text-zinc-950 px-4 py-2 rounded-xl text-sm font-bold hover:bg-emerald-600 transition-colors">
+                      Add
+                    </button>
+                  </form>
+                  {userError && <p className="text-red-500 text-xs mb-4">{userError}</p>}
+                  
+                  <div className="space-y-2">
+                    {users.map(u => (
+                      <div key={u.id} className="flex items-center justify-between bg-zinc-900 p-3 rounded-xl border border-white/5">
+                        <span className="text-sm font-medium">{u.username}</span>
+                        {u.username !== 'admin' && (
+                          <button onClick={() => handleDeleteUser(u.id)} className="text-red-500 hover:bg-red-500/10 p-2 rounded-lg transition-colors">
+                            <X className="w-4 h-4" />
+                          </button>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
               {/* Ticker Settings */}
               {activeTab === 'ticker' && (
               <div className="space-y-4 md:col-span-2">
@@ -1212,148 +1313,116 @@ export default function StreamApp({ token, onLogout }: { token: string; onLogout
               </div>
               )}
 
-              {/* Text Overlay Settings */}
+              {/* Watermarks Settings */}
               {activeTab === 'overlays' && (
-              <div className="space-y-4">
-              <div className="flex items-center gap-2 text-zinc-400">
-                <Type className="w-4 h-4" />
-                <span className="text-xs font-semibold uppercase tracking-widest">Text Overlay</span>
-              </div>
-              <input 
-                type="text"
-                value={overlayText}
-                onChange={(e) => setOverlayText(e.target.value)}
-                className="w-full bg-zinc-800 border border-white/10 rounded-xl px-4 py-3 text-sm focus:outline-none focus:ring-2 focus:ring-emerald-500/50 transition-all"
-                placeholder="Overlay text..."
-              />
-              <div className="grid grid-cols-2 gap-4">
-                <div className="space-y-2">
-                  <span className="text-[10px] uppercase tracking-widest text-zinc-500 font-bold">Color</span>
-                  <input 
-                    type="color"
-                    value={overlayTextColor}
-                    onChange={(e) => setOverlayTextColor(e.target.value)}
-                    className="w-full h-10 bg-zinc-800 border border-white/10 rounded-xl cursor-pointer"
-                  />
-                </div>
-                <div className="space-y-2">
-                  <span className="text-[10px] uppercase tracking-widest text-zinc-500 font-bold">Size</span>
-                  <input 
-                    type="number"
-                    value={overlayTextSize}
-                    onChange={(e) => setOverlayTextSize(parseInt(e.target.value))}
-                    className="w-full bg-zinc-800 border border-white/10 rounded-xl px-3 h-10 text-sm focus:outline-none focus:ring-2 focus:ring-emerald-500/50"
-                  />
-                </div>
-              </div>
-              <div className="space-y-2">
-                <div className="flex justify-between items-center text-[10px] uppercase tracking-widest text-zinc-500 font-bold">
-                  <span>Position X/Y</span>
-                </div>
-                <div className="flex gap-2">
-                  <input 
-                    type="range"
-                    min="0"
-                    max="100"
-                    value={overlayTextX}
-                    onChange={(e) => setOverlayTextX(parseInt(e.target.value))}
-                    className="flex-1 h-1.5 bg-zinc-800 rounded-lg appearance-none cursor-pointer accent-emerald-500"
-                  />
-                  <input 
-                    type="range"
-                    min="0"
-                    max="100"
-                    value={overlayTextY}
-                    onChange={(e) => setOverlayTextY(parseInt(e.target.value))}
-                    className="flex-1 h-1.5 bg-zinc-800 rounded-lg appearance-none cursor-pointer accent-emerald-500"
-                  />
-                </div>
-              </div>
-              </div>
-              )}
-
-              {/* Overlay Settings */}
-              {activeTab === 'overlays' && (
-              <div className="space-y-4">
-              <div className="flex items-center gap-2 text-zinc-400">
-                <ImageIcon className="w-4 h-4" />
-                <span className="text-xs font-semibold uppercase tracking-widest">Image / GIF Overlays</span>
-              </div>
-              
-              <div 
-                {...getRootProps()} 
-                className={cn(
-                  "border-2 border-dashed rounded-xl flex flex-col items-center justify-center p-6 cursor-pointer transition-all",
-                  isDragActive ? "border-emerald-500 bg-emerald-500/10" : "border-white/10 hover:border-white/20"
-                )}
-              >
-                <input {...getInputProps()} />
-                <Upload className="w-6 h-6 text-zinc-500 mb-2" />
-                <span className="text-[10px] text-zinc-500 uppercase font-bold tracking-widest text-center">
-                  Drop images or GIFs here
-                </span>
-              </div>
-
-              <div className="space-y-3 max-h-[300px] overflow-y-auto pr-2 custom-scrollbar">
-                {imageOverlays.map((overlay, index) => (
-                  <div key={overlay.id} className="p-3 bg-zinc-800/50 border border-white/5 rounded-xl space-y-3">
-                    <div className="flex items-center justify-between">
-                      <div className="flex items-center gap-2">
-                        <div className="w-8 h-8 rounded bg-zinc-900 border border-white/5 overflow-hidden flex items-center justify-center">
-                          <img src={overlay.src} className="max-w-full max-h-full object-contain" />
-                        </div>
-                        <span className="text-[10px] uppercase font-bold text-zinc-400">Overlay #{index + 1}</span>
-                      </div>
-                      <button 
-                        onClick={() => setImageOverlays(prev => prev.filter(img => img.id !== overlay.id))}
-                        className="p-1.5 hover:bg-red-500/10 text-zinc-500 hover:text-red-500 rounded-lg transition-all"
-                      >
-                        <X className="w-4 h-4" />
-                      </button>
-                    </div>
-
-                    <div className="space-y-2">
-                      <div className="flex justify-between items-center text-[8px] uppercase tracking-widest text-zinc-500 font-bold">
-                        <span>Size</span>
-                        <span className="text-emerald-500">{overlay.size}%</span>
-                      </div>
-                      <input 
-                        type="range"
-                        min="5"
-                        max="50"
-                        value={overlay.size}
-                        onChange={(e) => setImageOverlays(prev => prev.map(img => img.id === overlay.id ? { ...img, size: parseInt(e.target.value) } : img))}
-                        className="w-full h-1 bg-zinc-700 rounded-lg appearance-none cursor-pointer accent-emerald-500"
-                      />
-                    </div>
-
-                    <div className="grid grid-cols-2 gap-2">
-                      <div className="space-y-1">
-                        <span className="text-[8px] uppercase tracking-widest text-zinc-500 font-bold">X: {overlay.x}%</span>
-                        <input 
-                          type="range"
-                          min="0"
-                          max="100"
-                          value={overlay.x}
-                          onChange={(e) => setImageOverlays(prev => prev.map(img => img.id === overlay.id ? { ...img, x: parseInt(e.target.value) } : img))}
-                          className="w-full h-1 bg-zinc-700 rounded-lg appearance-none cursor-pointer accent-emerald-500"
-                        />
-                      </div>
-                      <div className="space-y-1">
-                        <span className="text-[8px] uppercase tracking-widest text-zinc-500 font-bold">Y: {overlay.y}%</span>
-                        <input 
-                          type="range"
-                          min="0"
-                          max="100"
-                          value={overlay.y}
-                          onChange={(e) => setImageOverlays(prev => prev.map(img => img.id === overlay.id ? { ...img, y: parseInt(e.target.value) } : img))}
-                          className="w-full h-1 bg-zinc-700 rounded-lg appearance-none cursor-pointer accent-emerald-500"
-                        />
-                      </div>
-                    </div>
+              <div className="space-y-4 md:col-span-2">
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center gap-2 text-zinc-400">
+                    <ImageIcon className="w-4 h-4" />
+                    <span className="text-xs font-semibold uppercase tracking-widest">Watermarks & Overlays</span>
                   </div>
-                ))}
-              </div>
+                  <button 
+                    onClick={() => {
+                      setOverlays(prev => [...prev, {
+                        id: Math.random().toString(36).substr(2, 9),
+                        type: 'text',
+                        content: 'New Watermark',
+                        size: 10,
+                        x: 50,
+                        y: 50,
+                        rotation: 0,
+                        color: '#ffffff'
+                      }]);
+                    }}
+                    className="flex items-center gap-1.5 px-3 py-1 bg-emerald-500/10 border border-emerald-500/20 rounded-full text-[10px] font-bold text-emerald-500 uppercase tracking-widest hover:bg-emerald-500/20 transition-all"
+                  >
+                    <Plus className="w-3 h-3" /> Add Text
+                  </button>
+                </div>
+                
+                <div 
+                  {...getRootProps()} 
+                  className={cn(
+                    "border-2 border-dashed rounded-xl flex flex-col items-center justify-center p-6 cursor-pointer transition-all",
+                    isDragActive ? "border-emerald-500 bg-emerald-500/10" : "border-white/10 hover:border-white/20"
+                  )}
+                >
+                  <input {...getInputProps()} />
+                  <Upload className="w-6 h-6 text-zinc-500 mb-2" />
+                  <span className="text-[10px] text-zinc-500 uppercase font-bold tracking-widest text-center">
+                    Drop images or GIFs here to add as watermarks
+                  </span>
+                </div>
+
+                <div className="space-y-3 max-h-[400px] overflow-y-auto pr-2 custom-scrollbar">
+                  {overlays.map((overlay, index) => (
+                    <div key={overlay.id} className={cn(
+                      "p-3 bg-zinc-800/50 border rounded-xl space-y-3 transition-colors",
+                      selectedOverlayId === overlay.id ? "border-emerald-500/50" : "border-white/5"
+                    )}>
+                      <div className="flex items-center justify-between">
+                        <div className="flex items-center gap-2">
+                          {overlay.type === 'image' ? (
+                            <div className="w-8 h-8 rounded bg-zinc-900 border border-white/5 overflow-hidden flex items-center justify-center">
+                              <img src={overlay.content} className="max-w-full max-h-full object-contain" />
+                            </div>
+                          ) : (
+                            <div className="w-8 h-8 rounded bg-zinc-900 border border-white/5 overflow-hidden flex items-center justify-center text-zinc-400">
+                              <Type className="w-4 h-4" />
+                            </div>
+                          )}
+                          <span className="text-[10px] uppercase font-bold text-zinc-400">
+                            {overlay.type === 'image' ? 'Image' : 'Text'} Watermark
+                          </span>
+                        </div>
+                        <button 
+                          onClick={() => setOverlays(prev => prev.filter(o => o.id !== overlay.id))}
+                          className="p-1.5 hover:bg-red-500/10 text-zinc-500 hover:text-red-500 rounded-lg transition-all"
+                        >
+                          <X className="w-4 h-4" />
+                        </button>
+                      </div>
+
+                      {overlay.type === 'text' && (
+                        <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
+                          <input 
+                            type="text"
+                            value={overlay.content}
+                            onChange={(e) => setOverlays(prev => prev.map(o => o.id === overlay.id ? { ...o, content: e.target.value } : o))}
+                            className="md:col-span-2 bg-zinc-900 border border-white/10 rounded-lg px-3 py-1.5 text-xs focus:outline-none focus:ring-1 focus:ring-emerald-500/50"
+                            placeholder="Watermark text..."
+                          />
+                          <input 
+                            type="color"
+                            value={overlay.color || '#ffffff'}
+                            onChange={(e) => setOverlays(prev => prev.map(o => o.id === overlay.id ? { ...o, color: e.target.value } : o))}
+                            className="w-full h-8 bg-zinc-900 border border-white/10 rounded-lg cursor-pointer"
+                          />
+                        </div>
+                      )}
+
+                      <div className="space-y-2">
+                        <div className="flex justify-between items-center text-[8px] uppercase tracking-widest text-zinc-500 font-bold">
+                          <span>Size</span>
+                          <span className="text-emerald-500">{overlay.size}%</span>
+                        </div>
+                        <input 
+                          type="range"
+                          min="1"
+                          max="100"
+                          value={overlay.size}
+                          onChange={(e) => setOverlays(prev => prev.map(o => o.id === overlay.id ? { ...o, size: parseInt(e.target.value) } : o))}
+                          className="w-full h-1 bg-zinc-700 rounded-lg appearance-none cursor-pointer accent-emerald-500"
+                        />
+                      </div>
+                    </div>
+                  ))}
+                  {overlays.length === 0 && (
+                    <div className="text-center py-8 text-zinc-500 text-xs font-medium">
+                      No watermarks added yet.
+                    </div>
+                  )}
+                </div>
               </div>
               )}
 

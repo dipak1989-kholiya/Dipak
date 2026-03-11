@@ -60,7 +60,7 @@ async function startServer() {
   // API Routes
   app.post("/api/auth/login", (req, res) => {
     const { username, password } = req.body;
-    const user = db.prepare('SELECT * FROM users WHERE username = ?').get(username) as any;
+    const user = db.prepare('SELECT * FROM users WHERE username = ?').get(username.trim()) as any;
     
     if (!user || !bcrypt.compareSync(password, user.password_hash)) {
       return res.status(401).json({ error: 'Invalid credentials' });
@@ -68,6 +68,41 @@ async function startServer() {
     
     const token = jwt.sign({ id: user.id, username: user.username }, JWT_SECRET, { expiresIn: '24h' });
     res.json({ token });
+  });
+
+  app.get("/api/users", authenticateToken, (req: any, res: any) => {
+    if (req.user.username !== 'admin') return res.status(403).json({ error: "Forbidden" });
+    const users = db.prepare("SELECT id, username FROM users").all();
+    res.json(users);
+  });
+
+  app.post("/api/users", authenticateToken, (req: any, res: any) => {
+    if (req.user.username !== 'admin') return res.status(403).json({ error: "Forbidden" });
+    const { username, password } = req.body;
+    if (!username || !password) return res.status(400).json({ error: "Username and password required" });
+    
+    try {
+      const hash = bcrypt.hashSync(password, 10);
+      db.prepare("INSERT INTO users (username, password_hash) VALUES (?, ?)").run(username.trim(), hash);
+      res.json({ success: true });
+    } catch (e: any) {
+      if (e.code === 'SQLITE_CONSTRAINT_UNIQUE') {
+        res.status(400).json({ error: "Username already exists" });
+      } else {
+        res.status(500).json({ error: "Database error" });
+      }
+    }
+  });
+
+  app.delete("/api/users/:id", authenticateToken, (req: any, res: any) => {
+    if (req.user.username !== 'admin') return res.status(403).json({ error: "Forbidden" });
+    const id = req.params.id;
+    const user = db.prepare("SELECT username FROM users WHERE id = ?").get(id) as any;
+    if (user && user.username === 'admin') {
+      return res.status(400).json({ error: "Cannot delete admin user" });
+    }
+    db.prepare("DELETE FROM users WHERE id = ?").run(id);
+    res.json({ success: true });
   });
 
   app.get("/api/destinations", authenticateToken, (req, res) => {
