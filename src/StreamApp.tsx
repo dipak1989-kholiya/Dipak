@@ -1,6 +1,7 @@
 import { useState, useRef, useEffect, useCallback, MouseEvent, TouchEvent, FormEvent } from 'react';
-import { Camera, Image as ImageIcon, Type, Play, Square, Settings, Upload, X, Plus, Sliders, ChevronDown, ChevronUp, Users } from 'lucide-react';
+import { Camera, Image as ImageIcon, Type, Play, Square, Settings, Upload, X, Plus, Sliders, ChevronDown, ChevronUp, Users, Clock, Calendar } from 'lucide-react';
 import { useDropzone } from 'react-dropzone';
+import AdBanner from './components/AdBanner';
 import { clsx, type ClassValue } from 'clsx';
 import { twMerge } from 'tailwind-merge';
 
@@ -15,18 +16,20 @@ type StreamDestination = {
   serverUrl: string;
   streamKey: string;
   enabled: boolean;
-  status: 'disconnected' | 'connecting' | 'streaming';
+  status: 'disconnected' | 'connecting' | 'streaming' | 'error';
+  errorMessage?: string;
 };
 
 type StreamOverlay = {
   id: string;
-  type: 'image' | 'text';
+  type: 'image' | 'text' | 'video' | 'clock' | 'date';
   content: string;
   size: number;
   x: number;
   y: number;
   rotation: number;
   color?: string;
+  opacity?: number;
 };
 
 const STORAGE_KEY = 'live_stream_settings';
@@ -199,6 +202,7 @@ export default function StreamApp({ token, username, onLogout }: { token: string
   const requestRef = useRef<number>(null);
   const tickerOffsetRef = useRef<number | null>(null);
   const imageElementsRef = useRef<Map<string, HTMLImageElement>>(new Map());
+  const videoElementsRef = useRef<Map<string, HTMLVideoElement>>(new Map());
   const mediaRecordersRef = useRef<Map<string, { recorder: MediaRecorder; ws: WebSocket }>>(new Map());
   const audioContextRef = useRef<AudioContext | null>(null);
   const destNodeRef = useRef<MediaStreamAudioDestinationNode | null>(null);
@@ -389,6 +393,7 @@ export default function StreamApp({ token, username, onLogout }: { token: string
           ctx.save();
           ctx.translate(x, y);
           ctx.rotate((overlay.rotation * Math.PI) / 180);
+          ctx.globalAlpha = overlay.opacity !== undefined ? overlay.opacity : 1;
           
           let boxWidth = size;
           let boxHeight = size;
@@ -400,7 +405,21 @@ export default function StreamApp({ token, username, onLogout }: { token: string
               const top = -size / 2;
               ctx.drawImage(img, left, top, size, size);
             }
-          } else if (overlay.type === 'text') {
+          } else if (overlay.type === 'video') {
+            const vid = videoElementsRef.current.get(overlay.id);
+            if (vid && vid.readyState >= 2) {
+              const left = -size / 2;
+              const top = -size / 2;
+              ctx.drawImage(vid, left, top, size, size);
+            }
+          } else if (overlay.type === 'text' || overlay.type === 'clock' || overlay.type === 'date') {
+            let textContent = overlay.content;
+            if (overlay.type === 'clock') {
+              textContent = new Date().toLocaleTimeString();
+            } else if (overlay.type === 'date') {
+              textContent = new Date().toLocaleDateString();
+            }
+
             ctx.font = `${size}px sans-serif`;
             ctx.fillStyle = overlay.color || '#ffffff';
             ctx.textAlign = 'center';
@@ -409,12 +428,15 @@ export default function StreamApp({ token, username, onLogout }: { token: string
             ctx.shadowBlur = 4;
             ctx.shadowOffsetX = 2;
             ctx.shadowOffsetY = 2;
-            ctx.fillText(overlay.content, 0, 0);
+            ctx.fillText(textContent, 0, 0);
             ctx.shadowColor = 'transparent';
             
-            boxWidth = ctx.measureText(overlay.content).width + 20;
+            boxWidth = ctx.measureText(textContent).width + 20;
             boxHeight = size + 10;
           }
+
+          // Reset alpha for selection feedback
+          ctx.globalAlpha = 1;
 
           // Draw selection/hover feedback
           if (selectedOverlayId === overlay.id || hoveredOverlayId === overlay.id) {
@@ -489,9 +511,10 @@ export default function StreamApp({ token, username, onLogout }: { token: string
       const reader = new FileReader();
       reader.onload = () => {
         const src = reader.result as string;
+        const type = file.type.startsWith('video/') ? 'video' : 'image';
         const newOverlay: StreamOverlay = {
           id: Math.random().toString(36).substr(2, 9),
-          type: 'image',
+          type,
           content: src,
           size: 15,
           x: 50,
@@ -507,7 +530,8 @@ export default function StreamApp({ token, username, onLogout }: { token: string
   const { getRootProps, getInputProps, isDragActive } = useDropzone({
     onDrop,
     accept: {
-      'image/*': []
+      'image/*': [],
+      'video/*': []
     },
     multiple: true
   } as any);
@@ -720,17 +744,21 @@ export default function StreamApp({ token, username, onLogout }: { token: string
 
           ws.onerror = (err) => {
             console.error(`WebSocket error for ${dest.name}:`, err);
-            updateDestination(dest.id, { status: 'disconnected' });
+            updateDestination(dest.id, { status: 'error', errorMessage: 'Connection failed' });
           };
 
-          ws.onclose = () => {
+          ws.onclose = (event) => {
             console.log(`WebSocket closed for ${dest.name}`);
-            updateDestination(dest.id, { status: 'disconnected' });
+            if (event.code !== 1000 && event.code !== 1001) {
+              updateDestination(dest.id, { status: 'error', errorMessage: `Closed unexpectedly (${event.code})` });
+            } else {
+              updateDestination(dest.id, { status: 'disconnected', errorMessage: undefined });
+            }
           };
 
         } catch (err) {
           console.error(`Failed to start stream for ${dest.name}:`, err);
-          updateDestination(dest.id, { status: 'disconnected' });
+          updateDestination(dest.id, { status: 'error', errorMessage: err instanceof Error ? err.message : 'Failed to start' });
         }
       });
 
@@ -784,11 +812,17 @@ export default function StreamApp({ token, username, onLogout }: { token: string
 
         let boxWidth = sizePx;
         let boxHeight = sizePx;
-        if (overlay.type === 'text') {
+        if (overlay.type === 'text' || overlay.type === 'clock' || overlay.type === 'date') {
           const ctx = canvas.getContext('2d');
           if (ctx) {
+            let textContent = overlay.content;
+            if (overlay.type === 'clock') {
+              textContent = new Date().toLocaleTimeString();
+            } else if (overlay.type === 'date') {
+              textContent = new Date().toLocaleDateString();
+            }
             ctx.font = `${sizePx}px sans-serif`;
-            boxWidth = ctx.measureText(overlay.content).width + 20;
+            boxWidth = ctx.measureText(textContent).width + 20;
             boxHeight = sizePx + 10;
           }
         }
@@ -842,11 +876,17 @@ export default function StreamApp({ token, username, onLogout }: { token: string
 
         let boxWidth = sizePx;
         let boxHeight = sizePx;
-        if (overlay.type === 'text') {
+        if (overlay.type === 'text' || overlay.type === 'clock' || overlay.type === 'date') {
           const ctx = canvas.getContext('2d');
           if (ctx) {
+            let textContent = overlay.content;
+            if (overlay.type === 'clock') {
+              textContent = new Date().toLocaleTimeString();
+            } else if (overlay.type === 'date') {
+              textContent = new Date().toLocaleDateString();
+            }
             ctx.font = `${sizePx}px sans-serif`;
-            boxWidth = ctx.measureText(overlay.content).width + 20;
+            boxWidth = ctx.measureText(textContent).width + 20;
             boxHeight = sizePx + 10;
           }
         }
@@ -930,6 +970,26 @@ export default function StreamApp({ token, username, onLogout }: { token: string
           />
         ))}
 
+        {/* Hidden Video Sources for Video Overlays */}
+        {overlays.filter(o => o.type === 'video').map(overlay => (
+          <video 
+            key={overlay.id}
+            ref={el => {
+              if (el) {
+                videoElementsRef.current.set(overlay.id, el);
+                el.play().catch(e => console.error("Video play error:", e));
+              } else {
+                videoElementsRef.current.delete(overlay.id);
+              }
+            }}
+            src={overlay.content}
+            loop
+            muted
+            playsInline
+            className="absolute opacity-0 pointer-events-none"
+          />
+        ))}
+
         {/* Composited Canvas */}
         <div className="flex-1 relative bg-black flex items-center justify-center min-h-0">
           <canvas 
@@ -973,25 +1033,39 @@ export default function StreamApp({ token, username, onLogout }: { token: string
               "flex items-center gap-2 px-3 py-1.5 rounded-full border backdrop-blur-md transition-all",
               isStreaming ? "bg-red-500/20 border-red-500/50 text-red-500" : 
               destinations.some(d => d.status === 'connecting') ? "bg-yellow-500/20 border-yellow-500/50 text-yellow-500" :
+              destinations.some(d => d.status === 'error') ? "bg-amber-500/20 border-amber-500/50 text-amber-500" :
               "bg-zinc-900/40 border-white/10 text-zinc-400"
             )}>
               <div className={cn(
                 "w-2 h-2 rounded-full",
                 isStreaming ? "bg-red-500 animate-pulse" : 
-                destinations.some(d => d.status === 'connecting') ? "bg-yellow-500 animate-bounce" : "bg-zinc-500"
+                destinations.some(d => d.status === 'connecting') ? "bg-yellow-500 animate-bounce" : 
+                destinations.some(d => d.status === 'error') ? "bg-amber-500" : "bg-zinc-500"
               )} />
               <span className="text-[10px] font-black uppercase tracking-widest">
                 {isStreaming ? `Live (${destinations.filter(d => d.status === 'streaming').length} Platforms)` : 
-                 destinations.some(d => d.status === 'connecting') ? "Connecting..." : "Standby"}
+                 destinations.some(d => d.status === 'connecting') ? "Connecting..." : 
+                 destinations.some(d => d.status === 'error') ? "Error" : "Standby"}
               </span>
             </div>
             
-            {isStreaming && (
+            {(isStreaming || destinations.some(d => d.status === 'error')) && (
               <div className="flex flex-col gap-1">
-                {destinations.filter(d => d.status === 'streaming').map(d => (
-                  <div key={d.id} className="flex items-center gap-2 px-2 py-1 bg-red-500/10 backdrop-blur-md border border-red-500/20 rounded-lg">
-                    <div className="w-1.5 h-1.5 rounded-full bg-red-500 animate-pulse" />
-                    <span className="text-[8px] font-bold uppercase tracking-widest text-red-500">{d.name}</span>
+                {destinations.filter(d => d.status === 'streaming' || d.status === 'error').map(d => (
+                  <div key={d.id} className={cn(
+                    "flex items-center gap-2 px-2 py-1 backdrop-blur-md border rounded-lg",
+                    d.status === 'streaming' ? "bg-red-500/10 border-red-500/20" : "bg-amber-500/10 border-amber-500/20"
+                  )}>
+                    <div className={cn(
+                      "w-1.5 h-1.5 rounded-full",
+                      d.status === 'streaming' ? "bg-red-500 animate-pulse" : "bg-amber-500"
+                    )} />
+                    <span className={cn(
+                      "text-[8px] font-bold uppercase tracking-widest",
+                      d.status === 'streaming' ? "text-red-500" : "text-amber-500"
+                    )}>
+                      {d.name} {d.status === 'error' ? '(Error)' : ''}
+                    </span>
                   </div>
                 ))}
               </div>
@@ -1321,23 +1395,59 @@ export default function StreamApp({ token, username, onLogout }: { token: string
                     <ImageIcon className="w-4 h-4" />
                     <span className="text-xs font-semibold uppercase tracking-widest">Watermarks & Overlays</span>
                   </div>
-                  <button 
-                    onClick={() => {
-                      setOverlays(prev => [...prev, {
-                        id: Math.random().toString(36).substr(2, 9),
-                        type: 'text',
-                        content: 'New Watermark',
-                        size: 10,
-                        x: 50,
-                        y: 50,
-                        rotation: 0,
-                        color: '#ffffff'
-                      }]);
-                    }}
-                    className="flex items-center gap-1.5 px-3 py-1 bg-emerald-500/10 border border-emerald-500/20 rounded-full text-[10px] font-bold text-emerald-500 uppercase tracking-widest hover:bg-emerald-500/20 transition-all"
-                  >
-                    <Plus className="w-3 h-3" /> Add Text
-                  </button>
+                  <div className="flex items-center gap-2">
+                    <button 
+                      onClick={() => {
+                        setOverlays(prev => [...prev, {
+                          id: Math.random().toString(36).substr(2, 9),
+                          type: 'text',
+                          content: 'New Watermark',
+                          size: 10,
+                          x: 50,
+                          y: 50,
+                          rotation: 0,
+                          color: '#ffffff'
+                        }]);
+                      }}
+                      className="flex items-center gap-1.5 px-3 py-1 bg-emerald-500/10 border border-emerald-500/20 rounded-full text-[10px] font-bold text-emerald-500 uppercase tracking-widest hover:bg-emerald-500/20 transition-all"
+                    >
+                      <Plus className="w-3 h-3" /> Text
+                    </button>
+                    <button 
+                      onClick={() => {
+                        setOverlays(prev => [...prev, {
+                          id: Math.random().toString(36).substr(2, 9),
+                          type: 'clock',
+                          content: '',
+                          size: 10,
+                          x: 50,
+                          y: 50,
+                          rotation: 0,
+                          color: '#ffffff'
+                        }]);
+                      }}
+                      className="flex items-center gap-1.5 px-3 py-1 bg-emerald-500/10 border border-emerald-500/20 rounded-full text-[10px] font-bold text-emerald-500 uppercase tracking-widest hover:bg-emerald-500/20 transition-all"
+                    >
+                      <Clock className="w-3 h-3" /> Clock
+                    </button>
+                    <button 
+                      onClick={() => {
+                        setOverlays(prev => [...prev, {
+                          id: Math.random().toString(36).substr(2, 9),
+                          type: 'date',
+                          content: '',
+                          size: 10,
+                          x: 50,
+                          y: 50,
+                          rotation: 0,
+                          color: '#ffffff'
+                        }]);
+                      }}
+                      className="flex items-center gap-1.5 px-3 py-1 bg-emerald-500/10 border border-emerald-500/20 rounded-full text-[10px] font-bold text-emerald-500 uppercase tracking-widest hover:bg-emerald-500/20 transition-all"
+                    >
+                      <Calendar className="w-3 h-3" /> Date
+                    </button>
+                  </div>
                 </div>
                 
                 <div 
@@ -1350,7 +1460,7 @@ export default function StreamApp({ token, username, onLogout }: { token: string
                   <input {...getInputProps()} />
                   <Upload className="w-6 h-6 text-zinc-500 mb-2" />
                   <span className="text-[10px] text-zinc-500 uppercase font-bold tracking-widest text-center">
-                    Drop images or GIFs here to add as watermarks
+                    Drop images, GIFs, or videos here to add as watermarks
                   </span>
                 </div>
 
@@ -1366,13 +1476,25 @@ export default function StreamApp({ token, username, onLogout }: { token: string
                             <div className="w-8 h-8 rounded bg-zinc-900 border border-white/5 overflow-hidden flex items-center justify-center">
                               <img src={overlay.content} className="max-w-full max-h-full object-contain" />
                             </div>
+                          ) : overlay.type === 'video' ? (
+                            <div className="w-8 h-8 rounded bg-zinc-900 border border-white/5 overflow-hidden flex items-center justify-center">
+                              <video src={overlay.content} className="max-w-full max-h-full object-contain" />
+                            </div>
+                          ) : overlay.type === 'clock' ? (
+                            <div className="w-8 h-8 rounded bg-zinc-900 border border-white/5 overflow-hidden flex items-center justify-center text-zinc-400">
+                              <Clock className="w-4 h-4" />
+                            </div>
+                          ) : overlay.type === 'date' ? (
+                            <div className="w-8 h-8 rounded bg-zinc-900 border border-white/5 overflow-hidden flex items-center justify-center text-zinc-400">
+                              <Calendar className="w-4 h-4" />
+                            </div>
                           ) : (
                             <div className="w-8 h-8 rounded bg-zinc-900 border border-white/5 overflow-hidden flex items-center justify-center text-zinc-400">
                               <Type className="w-4 h-4" />
                             </div>
                           )}
                           <span className="text-[10px] uppercase font-bold text-zinc-400">
-                            {overlay.type === 'image' ? 'Image' : 'Text'} Watermark
+                            {overlay.type === 'image' ? 'Image' : overlay.type === 'video' ? 'Video' : overlay.type === 'clock' ? 'Clock' : overlay.type === 'date' ? 'Date' : 'Text'} Watermark
                           </span>
                         </div>
                         <button 
@@ -1383,20 +1505,25 @@ export default function StreamApp({ token, username, onLogout }: { token: string
                         </button>
                       </div>
 
-                      {overlay.type === 'text' && (
+                      {(overlay.type === 'text' || overlay.type === 'clock' || overlay.type === 'date') && (
                         <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
-                          <input 
-                            type="text"
-                            value={overlay.content}
-                            onChange={(e) => setOverlays(prev => prev.map(o => o.id === overlay.id ? { ...o, content: e.target.value } : o))}
-                            className="md:col-span-2 bg-zinc-900 border border-white/10 rounded-lg px-3 py-1.5 text-xs focus:outline-none focus:ring-1 focus:ring-emerald-500/50"
-                            placeholder="Watermark text..."
-                          />
+                          {overlay.type === 'text' && (
+                            <input 
+                              type="text"
+                              value={overlay.content}
+                              onChange={(e) => setOverlays(prev => prev.map(o => o.id === overlay.id ? { ...o, content: e.target.value } : o))}
+                              className="md:col-span-2 bg-zinc-900 border border-white/10 rounded-lg px-3 py-1.5 text-xs focus:outline-none focus:ring-1 focus:ring-emerald-500/50"
+                              placeholder="Watermark text..."
+                            />
+                          )}
                           <input 
                             type="color"
                             value={overlay.color || '#ffffff'}
                             onChange={(e) => setOverlays(prev => prev.map(o => o.id === overlay.id ? { ...o, color: e.target.value } : o))}
-                            className="w-full h-8 bg-zinc-900 border border-white/10 rounded-lg cursor-pointer"
+                            className={cn(
+                              "h-8 bg-zinc-900 border border-white/10 rounded-lg cursor-pointer",
+                              overlay.type === 'text' ? "w-full" : "w-full md:col-span-3"
+                            )}
                           />
                         </div>
                       )}
@@ -1412,6 +1539,21 @@ export default function StreamApp({ token, username, onLogout }: { token: string
                           max="100"
                           value={overlay.size}
                           onChange={(e) => setOverlays(prev => prev.map(o => o.id === overlay.id ? { ...o, size: parseInt(e.target.value) } : o))}
+                          className="w-full h-1 bg-zinc-700 rounded-lg appearance-none cursor-pointer accent-emerald-500"
+                        />
+                      </div>
+
+                      <div className="space-y-2">
+                        <div className="flex justify-between items-center text-[8px] uppercase tracking-widest text-zinc-500 font-bold">
+                          <span>Opacity</span>
+                          <span className="text-emerald-500">{Math.round((overlay.opacity !== undefined ? overlay.opacity : 1) * 100)}%</span>
+                        </div>
+                        <input 
+                          type="range"
+                          min="0"
+                          max="100"
+                          value={Math.round((overlay.opacity !== undefined ? overlay.opacity : 1) * 100)}
+                          onChange={(e) => setOverlays(prev => prev.map(o => o.id === overlay.id ? { ...o, opacity: parseInt(e.target.value) / 100 } : o))}
                           className="w-full h-1 bg-zinc-700 rounded-lg appearance-none cursor-pointer accent-emerald-500"
                         />
                       </div>
@@ -1535,7 +1677,8 @@ export default function StreamApp({ token, username, onLogout }: { token: string
                         <div className={cn(
                           "w-2 h-2 rounded-full",
                           dest.status === 'streaming' ? "bg-red-500 animate-pulse" : 
-                          dest.status === 'connecting' ? "bg-yellow-500 animate-bounce" : "bg-zinc-500"
+                          dest.status === 'connecting' ? "bg-yellow-500 animate-bounce" : 
+                          dest.status === 'error' ? "bg-amber-500" : "bg-zinc-500"
                         )} />
                         {dest.id === 'youtube' || dest.id === 'facebook' ? (
                           <span className="text-xs font-bold uppercase tracking-wider">{dest.name}</span>
@@ -1551,6 +1694,7 @@ export default function StreamApp({ token, username, onLogout }: { token: string
                           "px-1.5 py-0.5 rounded text-[8px] font-black uppercase tracking-tighter",
                           dest.status === 'streaming' ? "bg-red-500 text-white animate-pulse" :
                           dest.status === 'connecting' ? "bg-yellow-500 text-zinc-950 animate-pulse" :
+                          dest.status === 'error' ? "bg-amber-500 text-white" :
                           "bg-zinc-700 text-zinc-400"
                         )}>
                           {dest.status}
@@ -1568,6 +1712,12 @@ export default function StreamApp({ token, username, onLogout }: { token: string
                         {dest.enabled ? "Enabled" : "Disabled"}
                       </button>
                     </div>
+
+                    {dest.status === 'error' && dest.errorMessage && (
+                      <div className="text-[10px] text-amber-500 bg-amber-500/10 border border-amber-500/20 rounded-lg p-2 font-medium">
+                        {dest.errorMessage}
+                      </div>
+                    )}
 
                     {dest.status === 'streaming' && streamStats[dest.id] ? (
                       <div className="grid grid-cols-3 gap-2 py-2 border-y border-white/5">
@@ -1675,15 +1825,18 @@ export default function StreamApp({ token, username, onLogout }: { token: string
                         <div className={cn(
                           "w-1.5 h-1.5 rounded-full",
                           dest.status === 'streaming' ? "bg-red-500 animate-pulse" : 
-                          dest.status === 'connecting' ? "bg-yellow-500 animate-bounce" : "bg-zinc-500"
+                          dest.status === 'connecting' ? "bg-yellow-500 animate-bounce" : 
+                          dest.status === 'error' ? "bg-amber-500" : "bg-zinc-500"
                         )} />
                         <span className={cn(
                           "text-[10px] uppercase tracking-widest font-bold",
                           dest.status === 'streaming' ? "text-red-500" : 
-                          dest.status === 'connecting' ? "text-yellow-500" : "text-zinc-500"
+                          dest.status === 'connecting' ? "text-yellow-500" : 
+                          dest.status === 'error' ? "text-amber-500" : "text-zinc-500"
                         )}>
                           {dest.name}: {dest.status === 'streaming' ? "Live" : 
-                           dest.status === 'connecting' ? "Connecting" : "Idle"}
+                           dest.status === 'connecting' ? "Connecting" : 
+                           dest.status === 'error' ? "Error" : "Idle"}
                         </span>
                       </div>
                     ))}
@@ -1693,6 +1846,7 @@ export default function StreamApp({ token, username, onLogout }: { token: string
               </div>
               )}
 
+              <AdBanner />
             </div>
           </div>
         </div>
