@@ -1,9 +1,10 @@
 import { useState, useRef, useEffect, useCallback, MouseEvent, TouchEvent, FormEvent } from 'react';
-import { Camera, Image as ImageIcon, Type, Play, Square, Settings, Upload, X, Plus, Sliders, ChevronDown, ChevronUp, Users, Clock, Calendar } from 'lucide-react';
+import { Camera, Image as ImageIcon, Type, Play, Square, Settings, Upload, X, Plus, Sliders, ChevronDown, ChevronUp, Users, Clock, Calendar, Globe, Video } from 'lucide-react';
 import { useDropzone } from 'react-dropzone';
 import AdBanner from './components/AdBanner';
 import { clsx, type ClassValue } from 'clsx';
 import { twMerge } from 'tailwind-merge';
+import Hls from 'hls.js';
 
 function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
@@ -22,7 +23,7 @@ type StreamDestination = {
 
 type StreamOverlay = {
   id: string;
-  type: 'image' | 'text' | 'video' | 'clock' | 'date';
+  type: 'image' | 'text' | 'video' | 'clock' | 'date' | 'datetime';
   content: string;
   size: number;
   x: number;
@@ -30,6 +31,7 @@ type StreamOverlay = {
   rotation: number;
   color?: string;
   opacity?: number;
+  volume?: number;
 };
 
 const STORAGE_KEY = 'live_stream_settings';
@@ -72,8 +74,18 @@ export default function StreamApp({ token, username, onLogout }: { token: string
   const [selectedOverlayId, setSelectedOverlayId] = useState<string | null>(null);
   const [hoveredOverlayId, setHoveredOverlayId] = useState<string | null>(null);
   const [showControls, setShowControls] = useState(true);
-  const [activeTab, setActiveTab] = useState<'stream' | 'overlays' | 'ticker' | 'adjust'>('stream');
+  const [activeTab, setActiveTab] = useState<'stream' | 'overlays' | 'ticker' | 'adjust' | 'timer'>('stream');
   const [cameraFacing, setCameraFacing] = useState<'user' | 'environment'>('user');
+  const [streamSource, setStreamSource] = useState<'camera' | 'videoFile' | 'url'>('camera');
+  const [fallbackVideoSrc, setFallbackVideoSrc] = useState<string | null>(null);
+  const [inputUrl, setInputUrl] = useState('');
+
+  // Countdown timer states
+  const [countdownDuration, setCountdownDuration] = useState<number>(5 * 60);
+  const [countdownRemaining, setCountdownRemaining] = useState<number>(5 * 60);
+  const [isCountdownActive, setIsCountdownActive] = useState<boolean>(false);
+  const [isCountdownPaused, setIsCountdownPaused] = useState<boolean>(false);
+  const [showCountdownOnStream, setShowCountdownOnStream] = useState<boolean>(false);
   const [idealWidth, setIdealWidth] = useState(1280);
   const [idealHeight, setIdealHeight] = useState(720);
   const [idealFrameRate, setIdealFrameRate] = useState(30);
@@ -162,6 +174,8 @@ export default function StreamApp({ token, username, onLogout }: { token: string
           if (settings.brightness !== undefined) setBrightness(settings.brightness);
           if (settings.contrast !== undefined) setContrast(settings.contrast);
           if (settings.saturation !== undefined) setSaturation(settings.saturation);
+          if (settings.streamSource !== undefined) setStreamSource(settings.streamSource);
+          if (settings.inputUrl !== undefined) setInputUrl(settings.inputUrl);
         } catch (e) {
           console.error("Failed to load settings", e);
         }
@@ -188,13 +202,15 @@ export default function StreamApp({ token, username, onLogout }: { token: string
       idealFrameRate,
       brightness,
       contrast,
-      saturation
+      saturation,
+      streamSource,
+      inputUrl
     };
     localStorage.setItem(STORAGE_KEY, JSON.stringify(settings));
   }, [
     destinations, tickerText, tickerSpeed, tickerHeightPercent, tickerYPercent,
     tickerTextColor, tickerBgColor, overlays, cameraFacing, idealWidth,
-    idealHeight, idealFrameRate, brightness, contrast, saturation
+    idealHeight, idealFrameRate, brightness, contrast, saturation, streamSource, inputUrl
   ]);
 
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -203,10 +219,12 @@ export default function StreamApp({ token, username, onLogout }: { token: string
   const tickerOffsetRef = useRef<number | null>(null);
   const imageElementsRef = useRef<Map<string, HTMLImageElement>>(new Map());
   const videoElementsRef = useRef<Map<string, HTMLVideoElement>>(new Map());
+  const hlsRef = useRef<Hls | null>(null);
   const mediaRecordersRef = useRef<Map<string, { recorder: MediaRecorder; ws: WebSocket }>>(new Map());
   const audioContextRef = useRef<AudioContext | null>(null);
   const destNodeRef = useRef<MediaStreamAudioDestinationNode | null>(null);
   const micSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
+  const canvasStreamRef = useRef<MediaStream | null>(null);
 
   // Simulate Live Stats
   useEffect(() => {
@@ -236,18 +254,67 @@ export default function StreamApp({ token, username, onLogout }: { token: string
   // Initialize Camera
   const startCamera = useCallback(async (useBasicConstraints = false) => {
     setHasError(null);
-    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-      setHasError("Your browser does not support camera access.");
-      return;
+    
+    // Stop existing stream first to release the device
+    if (hlsRef.current) {
+      hlsRef.current.destroy();
+      hlsRef.current = null;
     }
 
-    // Stop existing stream first to release the device
     setStream(prevStream => {
       if (prevStream) {
         prevStream.getTracks().forEach(track => track.stop());
       }
       return null;
     });
+
+    if (streamSource === 'videoFile') {
+      if (videoRef.current) {
+        videoRef.current.srcObject = null;
+        if (fallbackVideoSrc) {
+          videoRef.current.src = fallbackVideoSrc;
+          videoRef.current.loop = true;
+          try {
+            await videoRef.current.play();
+          } catch (e) {
+            console.warn("Auto-play prevented", e);
+          }
+        }
+      }
+      return;
+    }
+
+    if (streamSource === 'url') {
+      if (videoRef.current) {
+        videoRef.current.srcObject = null;
+        if (inputUrl) {
+          if (inputUrl.includes('.m3u8') && Hls.isSupported()) {
+            const hls = new Hls();
+            hls.loadSource(inputUrl);
+            hls.attachMedia(videoRef.current);
+            hls.on(Hls.Events.MANIFEST_PARSED, () => {
+              videoRef.current?.play().catch(console.error);
+            });
+            hlsRef.current = hls;
+          } else {
+            videoRef.current.src = inputUrl;
+            videoRef.current.crossOrigin = "anonymous";
+            videoRef.current.loop = true;
+            try {
+              await videoRef.current.play();
+            } catch (e) {
+              console.warn("Auto-play prevented", e);
+            }
+          }
+        }
+      }
+      return;
+    }
+
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      setHasError("Your browser does not support camera access.");
+      return;
+    }
 
     try {
       const constraints = useBasicConstraints ? {
@@ -263,16 +330,39 @@ export default function StreamApp({ token, username, onLogout }: { token: string
         audio: true
       };
       
-      const newStream = await navigator.mediaDevices.getUserMedia(constraints);
-      setStream(newStream);
+      try {
+        const newStream = await navigator.mediaDevices.getUserMedia(constraints);
+        setStream(newStream);
 
-      if (videoRef.current) {
-        videoRef.current.srcObject = newStream;
-        try {
-          await videoRef.current.play();
-        } catch (e) {
-          console.warn("Auto-play prevented", e);
+        if (videoRef.current) {
+          videoRef.current.srcObject = newStream;
+          try {
+            await videoRef.current.play();
+          } catch (e) {
+            console.warn("Auto-play prevented", e);
+          }
         }
+        setHasError(null); // Success! Clear any persistent errors
+      } catch (innerErr) {
+        // If audio access was denied, try video only
+        if (innerErr instanceof Error && (innerErr.name === 'NotAllowedError' || innerErr.message.toLowerCase().includes('permission denied'))) {
+          console.log("Audio/Video combined denied, trying video only...");
+          const videoOnlyConstraints = { ...constraints, audio: false };
+          try {
+            const videoOnlyStream = await navigator.mediaDevices.getUserMedia(videoOnlyConstraints);
+            setStream(videoOnlyStream);
+            if (videoRef.current) {
+              videoRef.current.srcObject = videoOnlyStream;
+              await videoRef.current.play();
+            }
+            setHasError(null);
+            return;
+          } catch (videoOnlyErr) {
+            console.error("Video-only attempt also failed", videoOnlyErr);
+            throw videoOnlyErr;
+          }
+        }
+        throw innerErr;
       }
     } catch (err) {
       console.error("Error accessing camera:", err);
@@ -281,10 +371,32 @@ export default function StreamApp({ token, username, onLogout }: { token: string
         startCamera(true);
         return;
       }
-      const errorMsg = err instanceof Error ? err.message : String(err);
+      let errorMsg = err instanceof Error ? err.message : String(err);
+      if (errorMsg.toLowerCase().includes('permission denied') || errorMsg.includes('NotAllowedError')) {
+        errorMsg = "Camera access was denied. If you're on a mobile device or using a locked browser, try opening the app in a new tab using the button below. You may also need to check your site settings to allow camera/microphone.";
+      }
       setHasError(errorMsg);
     }
-  }, [cameraFacing, idealWidth, idealHeight, idealFrameRate]);
+  }, [cameraFacing, idealWidth, idealHeight, idealFrameRate, streamSource, fallbackVideoSrc]);
+
+
+
+  // Countdown Timer Logic
+  useEffect(() => {
+    let timer: number;
+    if (isCountdownActive && !isCountdownPaused && countdownRemaining > 0) {
+      timer = window.setInterval(() => {
+        setCountdownRemaining(prev => {
+          if (prev <= 1) {
+            setIsCountdownActive(false);
+            return 0;
+          }
+          return prev - 1;
+        });
+      }, 1000);
+    }
+    return () => clearInterval(timer);
+  }, [isCountdownActive, isCountdownPaused, countdownRemaining]);
 
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
@@ -401,23 +513,33 @@ export default function StreamApp({ token, username, onLogout }: { token: string
           if (overlay.type === 'image') {
             const img = imageElementsRef.current.get(overlay.id);
             if (img && img.complete && img.naturalWidth > 0) {
-              const left = -size / 2;
-              const top = -size / 2;
-              ctx.drawImage(img, left, top, size, size);
+              const aspect = img.naturalHeight / img.naturalWidth;
+              boxWidth = size;
+              boxHeight = size * aspect;
+              const left = -boxWidth / 2;
+              const top = -boxHeight / 2;
+              ctx.drawImage(img, left, top, boxWidth, boxHeight);
             }
           } else if (overlay.type === 'video') {
             const vid = videoElementsRef.current.get(overlay.id);
             if (vid && vid.readyState >= 2) {
-              const left = -size / 2;
-              const top = -size / 2;
-              ctx.drawImage(vid, left, top, size, size);
+              const aspect = vid.videoHeight / vid.videoWidth;
+              boxWidth = size;
+              boxHeight = size * aspect;
+              const left = -boxWidth / 2;
+              const top = -boxHeight / 2;
+              ctx.drawImage(vid, left, top, boxWidth, boxHeight);
             }
-          } else if (overlay.type === 'text' || overlay.type === 'clock' || overlay.type === 'date') {
+          } else if (overlay.type === 'text' || overlay.type === 'clock' || overlay.type === 'date' || overlay.type === 'datetime') {
             let textContent = overlay.content;
             if (overlay.type === 'clock') {
               textContent = new Date().toLocaleTimeString();
             } else if (overlay.type === 'date') {
               textContent = new Date().toLocaleDateString();
+            } else if (overlay.type === 'datetime') {
+              // Alternate every 5 seconds
+              const showTime = Math.floor(Date.now() / 5000) % 2 === 0;
+              textContent = showTime ? new Date().toLocaleTimeString() : new Date().toLocaleDateString();
             }
 
             ctx.font = `${size}px sans-serif`;
@@ -496,6 +618,24 @@ export default function StreamApp({ token, username, onLogout }: { token: string
           tickerOffsetRef.current = canvas.width;
         }
 
+        // 4. Draw Countdown Timer
+        if (showCountdownOnStream) {
+          const mins = Math.floor(countdownRemaining / 60);
+          const secs = countdownRemaining % 60;
+          const timeString = `${mins}:${secs.toString().padStart(2, '0')}`;
+          
+          const cdSize = 60; // Fixed size for timer text or adjustable
+          ctx.font = `bold ${cdSize}px sans-serif`;
+          ctx.fillStyle = '#ffffff';
+          ctx.textAlign = 'right';
+          ctx.textBaseline = 'top';
+          ctx.shadowColor = 'rgba(0, 0, 0, 0.8)';
+          ctx.shadowBlur = 8;
+          ctx.shadowOffsetX = 2;
+          ctx.shadowOffsetY = 2;
+          ctx.fillText(timeString, canvas.width - 20, 20);
+          ctx.shadowColor = 'transparent';
+        }
       }
       requestRef.current = requestAnimationFrame(render);
     };
@@ -504,7 +644,21 @@ export default function StreamApp({ token, username, onLogout }: { token: string
     return () => {
       if (requestRef.current) cancelAnimationFrame(requestRef.current);
     };
-  }, [tickerText, overlays, tickerSpeed, tickerHeightPercent, tickerYPercent, brightness, contrast, saturation, tickerTextColor, tickerBgColor, selectedOverlayId, hoveredOverlayId, rotatingImageId, resizingImageId]);
+  }, [tickerText, overlays, tickerSpeed, tickerHeightPercent, tickerYPercent, brightness, contrast, saturation, tickerTextColor, tickerBgColor, selectedOverlayId, hoveredOverlayId, rotatingImageId, resizingImageId, showCountdownOnStream, countdownRemaining]);
+
+  // Sync video overlay volumes
+  useEffect(() => {
+    overlays.forEach(overlay => {
+      if (overlay.type === 'video') {
+        const vid = videoElementsRef.current.get(overlay.id);
+        if (vid) {
+          const vol = overlay.volume ?? 0;
+          vid.volume = vol;
+          vid.muted = vol === 0;
+        }
+      }
+    });
+  }, [overlays]);
 
   const onDrop = useCallback((acceptedFiles: File[]) => {
     acceptedFiles.forEach(file => {
@@ -519,7 +673,8 @@ export default function StreamApp({ token, username, onLogout }: { token: string
           size: 15,
           x: 50,
           y: 50,
-          rotation: 0
+          rotation: 0,
+          volume: type === 'video' ? 0 : undefined
         };
         setOverlays(prev => [...prev, newOverlay]);
       };
@@ -649,6 +804,96 @@ export default function StreamApp({ token, username, onLogout }: { token: string
     return '';
   };
 
+  const startSingleDestination = useCallback((dest: StreamDestination, canvasStream: MediaStream) => {
+    // If there's an existing recorder/ws for this dest, stop it first to prevent leaks
+    const existing = mediaRecordersRef.current.get(dest.id);
+    if (existing) {
+      try {
+        if (existing.recorder.state !== 'inactive') existing.recorder.stop();
+        if (existing.ws.readyState === WebSocket.OPEN) existing.ws.close();
+      } catch (e) {
+        console.warn("Error stopping existing recorder/ws on reconnect:", e);
+      }
+      mediaRecordersRef.current.delete(dest.id);
+    }
+
+    try {
+      updateDestination(dest.id, { status: 'connecting' });
+      const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+      const baseUrl = dest.serverUrl.endsWith('/') ? dest.serverUrl.slice(0, -1) : dest.serverUrl;
+      const rtmpFullUrl = `${baseUrl}/${dest.streamKey}`;
+      const wsUrl = `${protocol}//${window.location.host}/?rtmpUrl=${encodeURIComponent(rtmpFullUrl)}&token=${token}`;
+      
+      const ws = new WebSocket(wsUrl);
+      
+      ws.onopen = () => {
+        console.log(`WebSocket connected for ${dest.name}`);
+        
+        const mimeType = getSupportedMimeType();
+        if (!mimeType) {
+          console.error("No supported MediaRecorder MIME type found");
+          updateDestination(dest.id, { status: 'error', errorMessage: 'Unsupported browser/MIME type' });
+          return;
+        }
+
+        const recorder = new MediaRecorder(canvasStream, {
+          mimeType,
+          videoBitsPerSecond: 2500000
+        });
+
+        recorder.ondataavailable = (e) => {
+          if (e.data.size > 0 && ws.readyState === WebSocket.OPEN) {
+            console.log(`Sending chunk: ${e.data.size} bytes to ${dest.name}`);
+            ws.send(e.data);
+          }
+        };
+
+        recorder.onstop = () => {
+          if (ws.readyState === WebSocket.OPEN) ws.close();
+        };
+
+        recorder.start(1000); // Send data every 1 second
+        mediaRecordersRef.current.set(dest.id, { recorder, ws });
+        
+        updateDestination(dest.id, { status: 'streaming', errorMessage: undefined });
+      };
+
+      ws.onerror = (err) => {
+        console.error(`WebSocket error for ${dest.name}:`, err);
+        updateDestination(dest.id, { status: 'error', errorMessage: 'Connection failed' });
+      };
+
+      ws.onclose = (event) => {
+        console.log(`WebSocket closed for ${dest.name}`);
+        if (event.code !== 1000 && event.code !== 1001) {
+          updateDestination(dest.id, { status: 'error', errorMessage: `Closed unexpectedly (${event.code})` });
+        } else {
+          updateDestination(dest.id, { status: 'disconnected', errorMessage: undefined });
+        }
+      };
+
+    } catch (err) {
+      console.error(`Failed to start stream for ${dest.name}:`, err);
+      updateDestination(dest.id, { status: 'error', errorMessage: err instanceof Error ? err.message : 'Failed to start' });
+    }
+  }, [token, updateDestination]);
+
+  // Automatic Reconnection Effect on Error state
+  useEffect(() => {
+    if (!isStreaming || !canvasStreamRef.current) return;
+
+    const intervalId = setInterval(() => {
+      destinations.forEach(dest => {
+        if (dest.enabled && dest.status === 'error') {
+          console.log(`Auto-reconnecting destination ${dest.name}...`);
+          startSingleDestination(dest, canvasStreamRef.current!);
+        }
+      });
+    }, 5000);
+
+    return () => clearInterval(intervalId);
+  }, [isStreaming, destinations, startSingleDestination]);
+
   const handleStartStream = () => {
     const activeDestinations = destinations.filter(d => d.enabled);
     if (activeDestinations.length === 0) {
@@ -687,79 +932,51 @@ export default function StreamApp({ token, username, onLogout }: { token: string
       osc.start();
 
       // 2. Mix in the actual microphone audio if available
-      if (stream && stream.getAudioTracks().length > 0) {
+      if (streamSource === 'camera' && stream && stream.getAudioTracks().length > 0) {
         console.log(`Mixing ${stream.getAudioTracks().length} microphone tracks`);
         const micSource = audioCtx.createMediaStreamSource(stream);
         micSource.connect(destNode);
         micSourceRef.current = micSource;
+      } else if ((streamSource === 'videoFile' || streamSource === 'url') && videoRef.current) {
+        try {
+          const rawStream = (videoRef.current as any).captureStream ? (videoRef.current as any).captureStream() : (videoRef.current as any).mozCaptureStream ? (videoRef.current as any).mozCaptureStream() : null;
+          if (rawStream && rawStream.getAudioTracks().length > 0) {
+            const vidSource = audioCtx.createMediaStreamSource(rawStream);
+            vidSource.connect(destNode);
+          }
+        } catch (e) {
+          console.warn("Could not capture audio from fallback/URL video", e);
+        }
       } else {
-        console.warn("No microphone stream available, sending silent audio");
+        console.warn("No microphone stream or fallback audio available, sending silent audio");
       }
+
+      // 3. Mix in video overlay audio
+      overlays.forEach(overlay => {
+        if (overlay.type === 'video') {
+          const vid = videoElementsRef.current.get(overlay.id);
+          if (vid) {
+            try {
+              const rawStream = (vid as any).captureStream ? (vid as any).captureStream() : (vid as any).mozCaptureStream ? (vid as any).mozCaptureStream() : null;
+              if (rawStream && rawStream.getAudioTracks().length > 0) {
+                const vidSource = audioCtx.createMediaStreamSource(rawStream);
+                vidSource.connect(destNode);
+              }
+            } catch (e) {
+              console.warn("Could not capture audio from overlay video", e);
+            }
+          }
+        }
+      });
 
       // Add the mixed audio track to the canvas stream
       const mixedAudioTrack = destNode.stream.getAudioTracks()[0];
       canvasStream.addTrack(mixedAudioTrack);
 
+      canvasStreamRef.current = canvasStream; // Save canvas composite stream to ref
+
       activeDestinations.forEach(dest => {
-        try {
-          const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-          const baseUrl = dest.serverUrl.endsWith('/') ? dest.serverUrl.slice(0, -1) : dest.serverUrl;
-          const rtmpFullUrl = `${baseUrl}/${dest.streamKey}`;
-          const wsUrl = `${protocol}//${window.location.host}/?rtmpUrl=${encodeURIComponent(rtmpFullUrl)}&token=${token}`;
-          
-          const ws = new WebSocket(wsUrl);
-          
-          ws.onopen = () => {
-            console.log(`WebSocket connected for ${dest.name}`);
-            
-            const mimeType = getSupportedMimeType();
-            if (!mimeType) {
-              console.error("No supported MediaRecorder MIME type found");
-              return;
-            }
-
-            const recorder = new MediaRecorder(canvasStream, {
-              mimeType,
-              videoBitsPerSecond: 2500000
-            });
-
-            recorder.ondataavailable = (e) => {
-              if (e.data.size > 0 && ws.readyState === WebSocket.OPEN) {
-                console.log(`Sending chunk: ${e.data.size} bytes to ${dest.name}`);
-                ws.send(e.data);
-              }
-            };
-
-            recorder.onstop = () => {
-              if (ws.readyState === WebSocket.OPEN) ws.close();
-            };
-
-            recorder.start(1000); // Send data every 1 second
-            mediaRecordersRef.current.set(dest.id, { recorder, ws });
-            
-            setDestinations(prev => prev.map(d => 
-              d.id === dest.id ? { ...d, status: 'streaming' } : d
-            ));
-          };
-
-          ws.onerror = (err) => {
-            console.error(`WebSocket error for ${dest.name}:`, err);
-            updateDestination(dest.id, { status: 'error', errorMessage: 'Connection failed' });
-          };
-
-          ws.onclose = (event) => {
-            console.log(`WebSocket closed for ${dest.name}`);
-            if (event.code !== 1000 && event.code !== 1001) {
-              updateDestination(dest.id, { status: 'error', errorMessage: `Closed unexpectedly (${event.code})` });
-            } else {
-              updateDestination(dest.id, { status: 'disconnected', errorMessage: undefined });
-            }
-          };
-
-        } catch (err) {
-          console.error(`Failed to start stream for ${dest.name}:`, err);
-          updateDestination(dest.id, { status: 'error', errorMessage: err instanceof Error ? err.message : 'Failed to start' });
-        }
+        startSingleDestination(dest, canvasStream);
       });
 
       setIsStreaming(true);
@@ -777,6 +994,8 @@ export default function StreamApp({ token, username, onLogout }: { token: string
         destNodeRef.current = null;
         micSourceRef.current = null;
       }
+      
+      canvasStreamRef.current = null; // Clear from ref
       
       setDestinations(prev => prev.map(d => ({ ...d, status: 'disconnected' })));
       setIsStreaming(false);
@@ -812,7 +1031,18 @@ export default function StreamApp({ token, username, onLogout }: { token: string
 
         let boxWidth = sizePx;
         let boxHeight = sizePx;
-        if (overlay.type === 'text' || overlay.type === 'clock' || overlay.type === 'date') {
+
+        if (overlay.type === 'image') {
+          const img = imageElementsRef.current.get(overlay.id);
+          if (img && img.complete && img.naturalWidth > 0) {
+            boxHeight = sizePx * (img.naturalHeight / img.naturalWidth);
+          }
+        } else if (overlay.type === 'video') {
+          const vid = videoElementsRef.current.get(overlay.id);
+          if (vid && vid.readyState >= 2) {
+            boxHeight = sizePx * (vid.videoHeight / vid.videoWidth);
+          }
+        } else if (overlay.type === 'text' || overlay.type === 'clock' || overlay.type === 'date') {
           const ctx = canvas.getContext('2d');
           if (ctx) {
             let textContent = overlay.content;
@@ -876,7 +1106,18 @@ export default function StreamApp({ token, username, onLogout }: { token: string
 
         let boxWidth = sizePx;
         let boxHeight = sizePx;
-        if (overlay.type === 'text' || overlay.type === 'clock' || overlay.type === 'date') {
+
+        if (overlay.type === 'image') {
+          const img = imageElementsRef.current.get(overlay.id);
+          if (img && img.complete && img.naturalWidth > 0) {
+            boxHeight = sizePx * (img.naturalHeight / img.naturalWidth);
+          }
+        } else if (overlay.type === 'video') {
+          const vid = videoElementsRef.current.get(overlay.id);
+          if (vid && vid.readyState >= 2) {
+            boxHeight = sizePx * (vid.videoHeight / vid.videoWidth);
+          }
+        } else if (overlay.type === 'text' || overlay.type === 'clock' || overlay.type === 'date') {
           const ctx = canvas.getContext('2d');
           if (ctx) {
             let textContent = overlay.content;
@@ -977,6 +1218,9 @@ export default function StreamApp({ token, username, onLogout }: { token: string
             ref={el => {
               if (el) {
                 videoElementsRef.current.set(overlay.id, el);
+                const vol = overlay.volume ?? 0;
+                el.volume = vol;
+                el.muted = vol === 0;
                 el.play().catch(e => console.error("Video play error:", e));
               } else {
                 videoElementsRef.current.delete(overlay.id);
@@ -984,7 +1228,6 @@ export default function StreamApp({ token, username, onLogout }: { token: string
             }}
             src={overlay.content}
             loop
-            muted
             playsInline
             className="absolute opacity-0 pointer-events-none"
           />
@@ -1017,12 +1260,32 @@ export default function StreamApp({ token, username, onLogout }: { token: string
                 </div>
                 <h3 className="text-lg font-bold">Camera Error</h3>
                 <p className="text-sm text-zinc-400">{hasError}</p>
-                <button 
-                  onClick={() => startCamera()}
-                  className="w-full bg-emerald-500 text-zinc-950 rounded-xl py-3 font-bold hover:bg-emerald-600 transition-all"
-                >
-                  Retry Camera
-                </button>
+                <div className="flex flex-col gap-2">
+                  <button 
+                    onClick={() => {
+                      setHasError(null);
+                      startCamera();
+                    }}
+                    className="w-full bg-emerald-500 text-zinc-950 rounded-xl py-3 font-bold hover:bg-emerald-600 transition-all"
+                  >
+                    Retry Camera
+                  </button>
+                  <button 
+                    onClick={() => window.open(window.location.href, '_blank')}
+                    className="w-full bg-white/10 text-white rounded-xl py-3 font-bold hover:bg-white/20 transition-all border border-white/10"
+                  >
+                    Open in New Tab
+                  </button>
+                  <button 
+                    onClick={() => {
+                      setStreamSource('videoFile');
+                      setHasError(null);
+                    }}
+                    className="w-full bg-zinc-800 text-white rounded-xl py-3 font-bold hover:bg-zinc-700 transition-all"
+                  >
+                    Use Video File instead
+                  </button>
+                </div>
               </div>
             </div>
           )}
@@ -1221,6 +1484,7 @@ export default function StreamApp({ token, username, onLogout }: { token: string
             <button onClick={() => setActiveTab('overlays')} className={cn("px-4 py-2 rounded-full text-xs font-bold uppercase tracking-widest whitespace-nowrap transition-colors", activeTab === 'overlays' ? "bg-emerald-500 text-zinc-950" : "bg-zinc-800 text-zinc-400 hover:bg-zinc-700")}>Watermarks</button>
             <button onClick={() => setActiveTab('ticker')} className={cn("px-4 py-2 rounded-full text-xs font-bold uppercase tracking-widest whitespace-nowrap transition-colors", activeTab === 'ticker' ? "bg-emerald-500 text-zinc-950" : "bg-zinc-800 text-zinc-400 hover:bg-zinc-700")}>Ticker</button>
             <button onClick={() => setActiveTab('adjust')} className={cn("px-4 py-2 rounded-full text-xs font-bold uppercase tracking-widest whitespace-nowrap transition-colors", activeTab === 'adjust' ? "bg-emerald-500 text-zinc-950" : "bg-zinc-800 text-zinc-400 hover:bg-zinc-700")}>Adjust</button>
+            <button onClick={() => setActiveTab('timer')} className={cn("px-4 py-2 rounded-full text-xs font-bold uppercase tracking-widest whitespace-nowrap transition-colors", activeTab === 'timer' ? "bg-emerald-500 text-zinc-950" : "bg-zinc-800 text-zinc-400 hover:bg-zinc-700")}>Timer</button>
           </div>
 
           <div className="p-6 overflow-y-auto flex-1">
@@ -1396,6 +1660,63 @@ export default function StreamApp({ token, username, onLogout }: { token: string
                     <span className="text-xs font-semibold uppercase tracking-widest">Watermarks & Overlays</span>
                   </div>
                   <div className="flex items-center gap-2">
+                    <label className="flex items-center gap-1.5 px-3 py-1 bg-emerald-500/10 border border-emerald-500/20 rounded-full text-[10px] font-bold text-emerald-500 uppercase tracking-widest hover:bg-emerald-500/20 transition-all cursor-pointer">
+                      <ImageIcon className="w-3 h-3" /> Image
+                      <input 
+                        type="file" 
+                        accept="image/*" 
+                        className="hidden" 
+                        onChange={(e) => {
+                          const file = e.target.files?.[0];
+                          if (file) {
+                             const reader = new FileReader();
+                             reader.onload = () => {
+                               const src = reader.result as string;
+                               setOverlays(prev => [...prev, {
+                                 id: Math.random().toString(36).substr(2, 9),
+                                 type: 'image',
+                                 content: src,
+                                 size: 15,
+                                 x: 50,
+                                 y: 50,
+                                 rotation: 0
+                               }]);
+                             };
+                             reader.readAsDataURL(file);
+                          }
+                          e.target.value = ''; // Reset input
+                        }}
+                      />
+                    </label>
+                    <label className="flex items-center gap-1.5 px-3 py-1 bg-emerald-500/10 border border-emerald-500/20 rounded-full text-[10px] font-bold text-emerald-500 uppercase tracking-widest hover:bg-emerald-500/20 transition-all cursor-pointer">
+                      <Video className="w-3 h-3" /> Video
+                      <input 
+                        type="file" 
+                        accept="video/*" 
+                        className="hidden" 
+                        onChange={(e) => {
+                          const file = e.target.files?.[0];
+                          if (file) {
+                             const reader = new FileReader();
+                             reader.onload = () => {
+                               const src = reader.result as string;
+                               setOverlays(prev => [...prev, {
+                                 id: Math.random().toString(36).substr(2, 9),
+                                 type: 'video',
+                                 content: src,
+                                 size: 15,
+                                 x: 50,
+                                 y: 50,
+                                 rotation: 0,
+                                 volume: 0
+                               }]);
+                             };
+                             reader.readAsDataURL(file);
+                          }
+                          e.target.value = ''; // Reset input
+                        }}
+                      />
+                    </label>
                     <button 
                       onClick={() => {
                         setOverlays(prev => [...prev, {
@@ -1447,6 +1768,23 @@ export default function StreamApp({ token, username, onLogout }: { token: string
                     >
                       <Calendar className="w-3 h-3" /> Date
                     </button>
+                    <button 
+                      onClick={() => {
+                        setOverlays(prev => [...prev, {
+                          id: Math.random().toString(36).substr(2, 9),
+                          type: 'datetime',
+                          content: '',
+                          size: 10,
+                          x: 50,
+                          y: 50,
+                          rotation: 0,
+                          color: '#ffffff'
+                        }]);
+                      }}
+                      className="flex items-center gap-1.5 px-3 py-1 bg-emerald-500/10 border border-emerald-500/20 rounded-full text-[10px] font-bold text-emerald-500 uppercase tracking-widest hover:bg-emerald-500/20 transition-all"
+                    >
+                      <Clock className="w-3 h-3" /> Date & Time
+                    </button>
                   </div>
                 </div>
                 
@@ -1488,13 +1826,20 @@ export default function StreamApp({ token, username, onLogout }: { token: string
                             <div className="w-8 h-8 rounded bg-zinc-900 border border-white/5 overflow-hidden flex items-center justify-center text-zinc-400">
                               <Calendar className="w-4 h-4" />
                             </div>
+                          ) : overlay.type === 'datetime' ? (
+                            <div className="w-8 h-8 rounded bg-zinc-900 border border-white/5 overflow-hidden flex items-center justify-center text-zinc-400">
+                              <div className="relative">
+                                <Clock className="w-4 h-4" />
+                                <div className="absolute -top-1 -right-1 w-2 h-2 bg-emerald-500 rounded-full border border-zinc-900" />
+                              </div>
+                            </div>
                           ) : (
                             <div className="w-8 h-8 rounded bg-zinc-900 border border-white/5 overflow-hidden flex items-center justify-center text-zinc-400">
                               <Type className="w-4 h-4" />
                             </div>
                           )}
                           <span className="text-[10px] uppercase font-bold text-zinc-400">
-                            {overlay.type === 'image' ? 'Image' : overlay.type === 'video' ? 'Video' : overlay.type === 'clock' ? 'Clock' : overlay.type === 'date' ? 'Date' : 'Text'} Watermark
+                            {overlay.type === 'image' ? 'Image' : overlay.type === 'video' ? 'Video' : overlay.type === 'clock' ? 'Clock' : overlay.type === 'date' ? 'Date' : overlay.type === 'datetime' ? 'Date & Time' : 'Text'} Watermark
                           </span>
                         </div>
                         <button 
@@ -1505,7 +1850,7 @@ export default function StreamApp({ token, username, onLogout }: { token: string
                         </button>
                       </div>
 
-                      {(overlay.type === 'text' || overlay.type === 'clock' || overlay.type === 'date') && (
+                      {(overlay.type === 'text' || overlay.type === 'clock' || overlay.type === 'date' || overlay.type === 'datetime') && (
                         <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
                           {overlay.type === 'text' && (
                             <input 
@@ -1557,6 +1902,23 @@ export default function StreamApp({ token, username, onLogout }: { token: string
                           className="w-full h-1 bg-zinc-700 rounded-lg appearance-none cursor-pointer accent-emerald-500"
                         />
                       </div>
+
+                      {overlay.type === 'video' && (
+                        <div className="space-y-2">
+                          <div className="flex justify-between items-center text-[8px] uppercase tracking-widest text-zinc-500 font-bold">
+                            <span>Volume</span>
+                            <span className="text-emerald-500">{Math.round((overlay.volume || 0) * 100)}%</span>
+                          </div>
+                          <input 
+                            type="range"
+                            min="0"
+                            max="100"
+                            value={Math.round((overlay.volume || 0) * 100)}
+                            onChange={(e) => setOverlays(prev => prev.map(o => o.id === overlay.id ? { ...o, volume: parseInt(e.target.value) / 100 } : o))}
+                            className="w-full h-1 bg-zinc-700 rounded-lg appearance-none cursor-pointer accent-emerald-500"
+                          />
+                        </div>
+                      )}
                     </div>
                   ))}
                   {overlays.length === 0 && (
@@ -1634,7 +1996,98 @@ export default function StreamApp({ token, username, onLogout }: { token: string
 
               {/* Stream Configuration */}
               {activeTab === 'stream' && (
-              <div className="space-y-4 md:col-span-2">
+              <div className="space-y-8 md:col-span-2">
+
+              <div className="space-y-4">
+                <div className="flex items-center gap-2 text-zinc-400">
+                  <Camera className="w-4 h-4" />
+                  <span className="text-xs font-semibold uppercase tracking-widest">Stream Source</span>
+                </div>
+                <div className="flex gap-4">
+                  <label className="flex items-center gap-2 text-sm text-zinc-300">
+                    <input 
+                      type="radio" 
+                      name="streamSource" 
+                      checked={streamSource === 'camera'}
+                      onChange={() => {
+                        setStreamSource('camera');
+                      }}
+                      className="accent-emerald-500"
+                    />
+                    Camera
+                  </label>
+                  <label className="flex items-center gap-2 text-sm text-zinc-300">
+                    <input 
+                      type="radio" 
+                      name="streamSource" 
+                      checked={streamSource === 'videoFile'}
+                      onChange={() => {
+                        setStreamSource('videoFile');
+                      }}
+                      className="accent-emerald-500"
+                    />
+                    Uploaded Video
+                  </label>
+                  <label className="flex items-center gap-2 text-sm text-zinc-300">
+                    <input 
+                      type="radio" 
+                      name="streamSource" 
+                      checked={streamSource === 'url'}
+                      onChange={() => {
+                        setStreamSource('url');
+                      }}
+                      className="accent-emerald-500"
+                    />
+                    External URL
+                  </label>
+                </div>
+                
+                {streamSource === 'videoFile' && (
+                  <div className="space-y-2">
+                    <label className="block text-xs text-zinc-500 uppercase tracking-widest font-bold">Fallback Video Upload</label>
+                    <input 
+                      type="file" 
+                      accept="video/*"
+                      onChange={(e) => {
+                        const file = e.target.files?.[0];
+                        if (file) {
+                          const url = URL.createObjectURL(file);
+                          setFallbackVideoSrc(url);
+                        }
+                      }}
+                      className="text-sm text-zinc-400 file:mr-4 file:py-2 file:px-4 file:rounded-full file:border-0 file:text-xs file:font-semibold file:bg-emerald-500 file:text-zinc-950 hover:file:bg-emerald-600 outline-none w-full border border-white/10 rounded-lg p-2"
+                    />
+                    {fallbackVideoSrc && <p className="text-xs text-emerald-400">Video loaded successfully.</p>}
+                  </div>
+                )}
+
+                {streamSource === 'url' && (
+                  <div className="space-y-2">
+                    <label className="block text-xs text-zinc-500 uppercase tracking-widest font-bold">External Stream URL</label>
+                    <div className="flex gap-2">
+                      <div className="flex-1 relative">
+                        <Globe className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-zinc-500" />
+                        <input 
+                          type="text" 
+                          value={inputUrl}
+                          onChange={(e) => setInputUrl(e.target.value)}
+                          placeholder="https://example.com/stream.m3u8"
+                          className="w-full bg-zinc-900 border border-white/10 rounded-lg pl-10 pr-3 py-2 text-xs focus:outline-none focus:ring-1 focus:ring-emerald-500/50"
+                        />
+                      </div>
+                      <button 
+                        onClick={() => startCamera()}
+                        className="px-4 bg-emerald-500 text-zinc-950 rounded-lg text-xs font-bold hover:bg-emerald-600 transition-all"
+                      >
+                        Load
+                      </button>
+                    </div>
+                    <p className="text-[10px] text-zinc-500 italic">Supports direct video links and HLS (.m3u8) streams.</p>
+                  </div>
+                )}
+              </div>
+
+              <div className="space-y-4">
               <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
                 <div className="flex items-center gap-2 text-zinc-400">
                   <Settings className="w-4 h-4" />
@@ -1782,6 +2235,7 @@ export default function StreamApp({ token, username, onLogout }: { token: string
                 ))}
               </div>
               </div>
+              </div>
               )}
 
               {/* Stream Actions */}
@@ -1843,6 +2297,79 @@ export default function StreamApp({ token, username, onLogout }: { token: string
                   </div>
                 </div>
               </div>
+              </div>
+              )}
+
+              {/* Timer Settings */}
+              {activeTab === 'timer' && (
+              <div className="space-y-4 md:col-span-2">
+                <div className="flex items-center gap-2 text-zinc-400">
+                  <Clock className="w-4 h-4" />
+                  <span className="text-xs font-semibold uppercase tracking-widest">Countdown Timer</span>
+                </div>
+                
+                <div className="space-y-4 bg-zinc-950/50 p-4 rounded-xl border border-white/5">
+                  <div className="flex items-center justify-between">
+                    <label className="text-xs font-medium text-zinc-300">Show on Stream</label>
+                    <input 
+                      type="checkbox" 
+                      checked={showCountdownOnStream}
+                      onChange={(e) => setShowCountdownOnStream(e.target.checked)}
+                      className="w-4 h-4 accent-emerald-500 rounded bg-zinc-800 border-white/10"
+                    />
+                  </div>
+
+                  <div className="space-y-2">
+                    <label className="text-xs font-medium text-zinc-300">Duration (Minutes)</label>
+                    <input 
+                      type="number" 
+                      min="1"
+                      value={Math.floor(countdownDuration / 60)}
+                      onChange={(e) => {
+                        const mins = parseInt(e.target.value) || 1;
+                        const secs = mins * 60;
+                        setCountdownDuration(secs);
+                        setCountdownRemaining(secs);
+                        setIsCountdownActive(false);
+                        setIsCountdownPaused(false);
+                      }}
+                      className="w-full bg-zinc-800 border border-white/10 rounded-lg px-3 py-2 text-sm text-white"
+                    />
+                  </div>
+
+                  <div className="flex gap-2 pt-2">
+                    <button 
+                      onClick={() => {
+                        if (!isCountdownActive) {
+                          setIsCountdownActive(true);
+                          setIsCountdownPaused(false);
+                        } else {
+                          setIsCountdownPaused(!isCountdownPaused);
+                        }
+                      }}
+                      className="flex-1 bg-emerald-500 text-zinc-950 font-bold text-xs uppercase tracking-widest py-2 rounded-lg hover:bg-emerald-600 transition-colors"
+                    >
+                      {!isCountdownActive ? 'Start Timer' : isCountdownPaused ? 'Resume Timer' : 'Pause Timer'}
+                    </button>
+                    <button 
+                      onClick={() => {
+                        setIsCountdownActive(false);
+                        setIsCountdownPaused(false);
+                        setCountdownRemaining(countdownDuration);
+                      }}
+                      className="flex-1 bg-red-500/20 text-red-500 font-bold text-xs uppercase tracking-widest py-2 rounded-lg hover:bg-red-500/30 transition-colors"
+                    >
+                      Reset Timer
+                    </button>
+                  </div>
+                  
+                  <div className="mt-4 text-center">
+                    <div className="text-3xl font-mono font-bold tracking-wider">
+                      {Math.floor(countdownRemaining / 60)}:{(countdownRemaining % 60).toString().padStart(2, '0')}
+                    </div>
+                    <div className="text-[10px] uppercase tracking-widest text-zinc-500 mt-1">Remaining Time</div>
+                  </div>
+                </div>
               </div>
               )}
 

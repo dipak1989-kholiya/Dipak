@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: stream-app
+    env: docker
+    plan: starter
+    disk:
+      name: sqlite-data
+      mountPath: /data
+      sizeGB: 1
+    envVars:
+      - key: PORT
+        value: 3000
+      - key: DATA_DIR
+        value: /data
+      - key: JWT_SECRET
+        generateValue: true

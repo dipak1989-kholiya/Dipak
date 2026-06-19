@@ -15,7 +15,8 @@ const __dirname = path.dirname(__filename);
 
 const JWT_SECRET = process.env.JWT_SECRET || "super-secret-key-change-in-production";
 
-const db = new Database("streaming.db");
+const dataDir = process.env.DATA_DIR || '.';
+const db = new Database(path.join(dataDir, "streaming.db"));
 
 // Initialize database
 db.exec(`
@@ -47,7 +48,7 @@ async function startServer() {
   const app = express();
   app.use(express.json());
   const server = http.createServer(app);
-  const PORT = 3000;
+  const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
 
   // Auth Middleware
   const authenticateToken = (req: any, res: any, next: any) => {
